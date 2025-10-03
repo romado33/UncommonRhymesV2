@@ -1,14 +1,11 @@
 from __future__ import annotations
-import sqlite3, json, re
+import sqlite3, json, re, io, csv
 from functools import lru_cache
 from typing import List, Tuple, Dict
 from unidecode import unidecode
 from wordfreq import zipf_frequency
 from .phonetics import key_k1, key_k2
-
-VOWELS = {
-    "AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"
-}
+from .scoring import classify, syllables
 
 def _clean(text: str) -> str:
     return re.sub(r"[^a-zA-Z'\- ]+", "", unidecode(text)).strip().lower()
@@ -37,28 +34,6 @@ def _candidates_by_key(key_col: str, key: Tuple[str,...], limit: int=500) -> Lis
     ).fetchall()
     return [{"word": r["word"], "pron": json.loads(r["pron"]), "syls": r["syls"]} for r in rows]
 
-def _is_vowel(phone: str) -> bool:
-    base = re.sub(r"\d", "", phone)
-    return base in VOWELS
-
-def _only_vowels(phones: Tuple[str,...]) -> Tuple[str,...]:
-    return tuple(re.sub(r"\d", "", p) for p in phones if _is_vowel(p))
-
-def _only_cons(phones: Tuple[str,...]) -> Tuple[str,...]:
-    return tuple(re.sub(r"\d", "", p) for p in phones if not _is_vowel(p))
-
-def _syllables(phones: Tuple[str,...]) -> int:
-    return sum(1 for p in phones if _is_vowel(p))
-
-def _classify(src_tail: Tuple[str,...], cand_tail: Tuple[str,...]) -> str:
-    if cand_tail == src_tail:
-        return "perfect"
-    if _only_vowels(cand_tail) == _only_vowels(src_tail):
-        return "assonant"
-    if _only_cons(cand_tail) == _only_cons(src_tail):
-        return "consonant"
-    return "slant"
-
 def _rarity_score(word: str) -> float:
     z = zipf_frequency(word, "en")
     z = max(0.0, min(8.0, z))
@@ -71,6 +46,9 @@ def search_word(
     syllable_min: int=1,
     syllable_max: int=8,
     max_results: int=150,
+    weight_quality: float=0.6,
+    weight_rarity: float=0.4,
+    include_pron: bool=False,
 ) -> List[Dict]:
     w = _clean(word)
     info = _keys_for_word(w)
@@ -78,7 +56,7 @@ def search_word(
         return []
     k1, k2, src_pron = info
     src_tail = tuple(key_k1(list(src_pron)))
-    pool = _candidates_by_key("k1", k1, 600) + _candidates_by_key("k2", k2, 600)
+    pool = _candidates_by_key("k1", k1, 800) + _candidates_by_key("k2", k2, 800)
 
     seen, filtered = set(), []
     for c in pool:
@@ -94,18 +72,18 @@ def search_word(
     results = []
     for c in filtered:
         cand_tail = tuple(key_k1(c["pron"]))
-        rtype = _classify(src_tail, cand_tail)
+        rtype = classify(src_tail, cand_tail)
         if rhyme_type != "any" and rtype != rhyme_type:
             continue
-        multi = _syllables(src_tail) >= 2
+        multi = syllables(src_tail) >= 2
         rhyme_q = {"perfect":1.0, "assonant":0.75, "consonant":0.65, "slant":0.5}[rtype]
         if multi:
             rhyme_q = min(rhyme_q + 0.1, 1.1)
         rar = _rarity_score(c["word"])
-        score = 0.6 * rhyme_q + 0.4 * rar
+        score = weight_quality * rhyme_q + weight_rarity * rar
         results.append({
             "word": c["word"],
-            "pron": c["pron"],
+            "pron": c["pron"] if include_pron else None,
             "syls": c["syls"],
             "rhyme_type": ("multisyllabic "+rtype) if (multi and rtype=="perfect") else rtype,
             "score": round(score, 4),
@@ -121,3 +99,20 @@ def search_phrase_to_words(phrase: str, **kwargs) -> List[Dict]:
         return []
     last = parts[-1]
     return search_word(last, **kwargs)
+
+def make_csv_bytes(word: str, **kwargs) -> bytes:
+    rows = search_word(word, **kwargs)
+    output = io.StringIO()
+    import csv
+    writer = csv.writer(output)
+    header = ["word","pron","rhyme_type","score","why"]
+    writer.writerow(header)
+    for r in rows:
+        writer.writerow([
+            r.get("word",""),
+            " ".join(r.get("pron") or []),
+            r.get("rhyme_type",""),
+            r.get("score",0.0),
+            r.get("why",""),
+        ])
+    return output.getvalue().encode("utf-8")
