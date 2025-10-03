@@ -1,11 +1,11 @@
 import gradio as gr
-import os
 from pathlib import Path
 from rhyme_core.search import search_word, search_phrase_to_words
+from rhyme_core.patterns import find_patterns_by_keys
 
 def do_word(word, rhyme_type, slant, syl_min, syl_max):
     res = search_word(word, rhyme_type=rhyme_type, slant_strength=slant,
-                      syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=150)
+                      syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=200)
     if not res:
         return []
     first = [res[0]["word"], res[0].get("rhyme_type",""), res[0].get("score",0.0), res[0].get("why","")]
@@ -14,34 +14,30 @@ def do_word(word, rhyme_type, slant, syl_min, syl_max):
 
 def do_phrase(phrase, rhyme_type, slant, syl_min, syl_max):
     res = search_phrase_to_words(phrase, rhyme_type=rhyme_type, slant_strength=slant,
-                                 syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=150)
+                                 syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=200)
     if not res:
         return []
     first = [res[0]["word"], res[0].get("rhyme_type",""), res[0].get("score",0.0), res[0].get("why","")]
     rest = [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")] for r in res[1:]]
     return [first] + rest
 
-with gr.Blocks() as demo:
+def do_patterns(phrase, limit):
+    rows = find_patterns_by_keys(phrase, limit=int(limit))
+    out = []
+    for r in rows:
+        out.append([r.get("_table","patterns"), r.get("id",""), r.get("_preview","")])
+    return out
 
-    # ---- Environment checks (friendly banner) ----
+with gr.Blocks() as demo:
     data_dir = Path("data")
     has_index = (data_dir / "words_index.sqlite").exists()
     has_patterns = (data_dir / "patterns.db").exists() or (data_dir / "patterns_small.db").exists()
+    msgs = []
+    msgs.append("✅ **Word index**: found." if has_index else "⚠️ **Word index missing**: build with `python -m scripts.build_index`.")
+    msgs.append("ℹ️ **Patterns DB**: found." if has_patterns else "ℹ️ **Patterns DB not present (optional)**.")
+    gr.Markdown("\n".join(msgs))
 
-    status_msgs = []
-    if has_index:
-        status_msgs.append("✅ **Word index**: `data/words_index.sqlite` found.")
-    else:
-        status_msgs.append("⚠️ **Word index missing**: build it with `python -m scripts.build_index`. The app may return no results until this file exists.")
-
-    if has_patterns:
-        status_msgs.append("ℹ️ **Patterns DB**: found (`patterns.db` or `patterns_small.db`). This is optional for Phase 1.")
-    else:
-        status_msgs.append("ℹ️ **Patterns DB not present (optional)**: core features work without it. Add later for multi-word pattern lookups.")
-
-    gr.Markdown("\n".join(status_msgs))
-    # ----------------------------------------------
-    gr.Markdown("# Rhyme Rarity (core)")
+    gr.Markdown("# Rhyme Rarity")
     with gr.Tab("Word → rhymes"):
         w = gr.Textbox(label="Word", placeholder="window")
         with gr.Row():
@@ -65,6 +61,13 @@ with gr.Blocks() as demo:
         btn2 = gr.Button("Search")
         out2 = gr.Dataframe(headers=["Candidate","Type","Score","Why"], datatype=["str","str","number","str"], wrap=True)
         btn2.click(do_phrase, [p, rhyme_type2, slant2, syl_min2, syl_max2], out2)
+
+    with gr.Tab("Phrase → patterns (v2)"):
+        pp = gr.Textbox(label="Phrase", placeholder="him so")
+        limit = gr.Slider(5, 200, value=50, step=5, label="Max rows")
+        btn3 = gr.Button("Find patterns")
+        out3 = gr.Dataframe(headers=["Table","ID","Preview"], datatype=["str","str","str"], wrap=True)
+        btn3.click(do_patterns, [pp, limit], out3)
 
 if __name__ == "__main__":
     demo.launch()
