@@ -10,7 +10,8 @@ def _clean(text: str) -> str:
 
 @lru_cache(maxsize=1)
 def _db() -> sqlite3.Connection:
-    con = sqlite3.connect("data/words_index.sqlite")
+    # Allow use from Gradio worker threads (read-only queries)
+    con = sqlite3.connect("data/words_index.sqlite", check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
@@ -57,9 +58,9 @@ def search_word(
             continue
         seen.add(c["word"])
         filtered.append(c)
-    # Minimal scoring/classification (expand in rarity.py later)
+    # Minimal scoring/classification (placeholder)
     for c in filtered:
-        c["rhyme_type"] = "perfect"  # placeholder; replace with finer classifier
+        c["rhyme_type"] = "perfect"  # TODO: replace with classifier
         c["score"] = 1.0
         c["why"] = "Matches final stressed-vowel rime (K1) or two-syllable key (K2)."
     filtered.sort(key=lambda x: (-x["score"], x["word"]))

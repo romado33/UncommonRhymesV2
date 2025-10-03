@@ -6,14 +6,20 @@ from rhyme_core.search import search_word, search_phrase_to_words
 def do_word(word, rhyme_type, slant, syl_min, syl_max):
     res = search_word(word, rhyme_type=rhyme_type, slant_strength=slant,
                       syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=150)
-    if not res: return []
-    return [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")]] +            [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")] for r in res[1:]]
+    if not res:
+        return []
+    first = [res[0]["word"], res[0].get("rhyme_type",""), res[0].get("score",0.0), res[0].get("why","")]
+    rest = [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")] for r in res[1:]]
+    return [first] + rest
 
 def do_phrase(phrase, rhyme_type, slant, syl_min, syl_max):
     res = search_phrase_to_words(phrase, rhyme_type=rhyme_type, slant_strength=slant,
                                  syllable_min=int(syl_min), syllable_max=int(syl_max), max_results=150)
-    if not res: return []
-    return [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")]] +            [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")] for r in res[1:]]
+    if not res:
+        return []
+    first = [res[0]["word"], res[0].get("rhyme_type",""), res[0].get("score",0.0), res[0].get("why","")]
+    rest = [[r["word"], r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")] for r in res[1:]]
+    return [first] + rest
 
 with gr.Blocks() as demo:
 
