@@ -1,8 +1,8 @@
-name: Sync to Hugging Face Space
+name: Sync to Hugging Face hub
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true          # pull LFS files if you use them
+          lfs: true
 
       - name: Configure Git identity
         run: |
@@ -25,8 +25,19 @@ jobs:
       - name: Push to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USER: romado33
+          HF_SPACE: UncommonRhymesV2
         run: |
-          # Replace both 'romado33' and 'UncommonRhymesV2' below if needed
-          git remote add space "https://romado33:${HF_TOKEN}@huggingface.co/spaces/romado33/UncommonRhymesV2.git"
-          # Push the current commit to the Space's main branch
-          git push --force space HEAD:main
+          set -e
+          # auth’d remote (prevents 429 and credential prompts)
+          git remote remove space 2>/dev/null || true
+          git remote add space "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_USER}/${HF_SPACE}.git"
+
+          # modest retry in case of transient 429s
+          n=0
+          until [ $n -ge 3 ]; do
+            git push --force space HEAD:main && break
+            n=$((n+1))
+            echo "Push failed, retry $n/3 after backoff..."
+            sleep $((10 * n))
+          done
