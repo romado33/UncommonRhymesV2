@@ -111,7 +111,15 @@ with gr.Blocks() as demo:
     with gr.Row():
         out_patterns = gr.Dataframe(headers=["Table","ID","Preview"], datatype=["str","str","str"], label="Rap Pattern Database (by rhyme keys)", wrap=True)
 
-    # Bind the 8 inputs; do_search also accepts legacy 5-arg calls if the Space cached an older layout
+    # --- COMPAT: bind BOTH input signatures to the same handler ---
+    # Legacy (5 inputs): word, rhyme_type, slant, syl_min, syl_max
+    btn.click(
+        do_search,
+        [word, rhyme_type, slant, syl_min, syl_max],
+        [out_uncommon, out_slant, out_multi, out_patterns]
+    )
+
+    # New (8 inputs): word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit
     btn.click(
         do_search,
         [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit],
