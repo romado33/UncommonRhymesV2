@@ -1,0 +1,2 @@
+data/words_index.sqlite filter=lfs diff=lfs merge=lfs -text
+data/patterns_small.db filter=lfs diff=lfs merge=lfs -text
