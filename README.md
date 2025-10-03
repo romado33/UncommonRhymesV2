@@ -1,6 +1,6 @@
 ﻿---
 title: Uncommon Rhymes V2
-emoji: 🎤
+emoji: 🪄
 colorFrom: green
 colorTo: blue
 sdk: gradio
