@@ -1,9 +1,9 @@
-# rhyme_core/patterns.py
 from __future__ import annotations
-import os, sqlite3, json
+import sqlite3, json
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from rhyme_core.search import _clean, _keys_for_word  # reuse helpers
+from typing import List, Dict, Optional
+from rhyme_core.search import _clean, _keys_for_word, _get_pron
+from rhyme_core.prosody import syllable_count, stress_pattern_str, metrical_name
 
 DB_CANDIDATES = [Path("data/patterns_small.db"), Path("data/patterns.db")]
 
@@ -15,32 +15,17 @@ def _open() -> Optional[sqlite3.Connection]:
             return con
     return None
 
-def _list_tables(cur) -> list[str]:
-    return [r[0] for r in cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    ]
-
-def _has_cols(cur, table: str, needed: Tuple[str, ...]) -> bool:
-    cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
-    return all(c in cols for c in needed)
-
 def _resolve_table(cur) -> str:
-    # 1) explicit env override
-    t = os.environ.get("PATTERNS_TABLE")
-    if t and _has_cols(cur, t, ("last_word_rime_key","last_two_syllables_key")):
-        return t
-    # 2) prefer 'patterns'
-    if "patterns" in _list_tables(cur) and _has_cols(cur, "patterns",
-        ("last_word_rime_key","last_two_syllables_key")):
+    tabs = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    if "patterns" in tabs:
         return "patterns"
-    # 3) otherwise, pick any table that has the key columns
-    for tab in _list_tables(cur):
-        if _has_cols(cur, tab, ("last_word_rime_key","last_two_syllables_key")):
-            return tab
-    # fallback
+    for t in tabs:
+        cols = {r[1] for r in cur.execute(f"PRAGMA table_info({t})").fetchall()}
+        if "last_word_rime_key" in cols and "last_two_syllables_key" in cols:
+            return t
     return "patterns"
 
-def find_patterns_by_keys(phrase: str, limit: int = 50) -> List[Dict]:
+def find_patterns_by_keys_enriched(phrase: str, limit: int = 50) -> List[Dict]:
     tokens = _clean(phrase).split()
     if not tokens:
         return []
@@ -68,9 +53,27 @@ def find_patterns_by_keys(phrase: str, limit: int = 50) -> List[Dict]:
     out = []
     for r in rows:
         d = dict(r)
-        d["_table"] = table
-        d["_preview"] = (d.get("pattern") or d.get("target_context") or d.get("source_context") or "")[:200]
-        out.append(d)
+        target = (d.get("target_word") or d.get("source_word") or "").strip().lower()
+        pron = _get_pron(target) or []
+        syls = syllable_count(pron)
+        stress = stress_pattern_str(pron)
+        meter = metrical_name(stress) if stress else "—"
+        ctx_src = (d.get("source_context") or "").strip()
+        ctx_tgt = (d.get("target_context") or "").strip()
+        lyric_context = ctx_src
+        if ctx_tgt:
+            lyric_context = f"{ctx_src} ⟂ {ctx_tgt}" if ctx_src else ctx_tgt
+
+        out.append({
+            "id": d.get("id"),
+            "artist": d.get("artist",""),
+            "song_title": d.get("song_title",""),
+            "target_rhyme": target,
+            "syllables": syls,
+            "stress": stress,
+            "meter": meter,
+            "lyric_context": lyric_context[:300],
+        })
 
     con.close()
     return out
