@@ -7,6 +7,10 @@ from wordfreq import zipf_frequency
 from .phonetics import key_k1, key_k2
 from .scoring import classify, syllables
 
+# Accept letters with optional apostrophes / hyphens / spaces.
+# Reject anything starting with punctuation (e.g. ")close-parentheses").
+VALID_WORD_RE = re.compile(r"^[a-z][a-z'\- ]*$")
+
 def _clean(text: str) -> str:
     return re.sub(r"[^a-zA-Z'\- ]+", "", unidecode(text)).strip().lower()
 
@@ -42,7 +46,7 @@ def _rarity_score(word: str) -> float:
 def search_word(
     word: str,
     rhyme_type: str="any",
-    slant_strength: float=0.5,
+    slant_strength: float=0.5,   # reserved for future weighting
     syllable_min: int=1,
     syllable_max: int=8,
     max_results: int=150,
@@ -60,13 +64,17 @@ def search_word(
 
     seen, filtered = set(), []
     for c in pool:
-        if c["word"] == w:
+        w_cand = c["word"]
+        if w_cand == w:
             continue
         if not (syllable_min <= c["syls"] <= syllable_max):
             continue
-        if c["word"] in seen:
+        # NEW: reject non-words / garbage tokens
+        if not VALID_WORD_RE.match(w_cand):
             continue
-        seen.add(c["word"])
+        if w_cand in seen:
+            continue
+        seen.add(w_cand)
         filtered.append(c)
 
     results = []

@@ -10,13 +10,19 @@ def _rarity(word: str) -> float:
     return (8.0 - z) / 8.0
 
 def _build_table(res, include_pron=False):
+    """Always return 5 columns to match the Dataframe headers."""
     rows = []
     for r in res:
-        row = [r["word"]]
-        if include_pron:
-            row.append(" ".join(r.get("pron") or []))
-        row += [r.get("rhyme_type",""), r.get("score",0.0), r.get("why","")]
-        rows.append(row)
+        pron = " ".join(r.get("pron") or [])
+        if not include_pron:
+            pron = ""
+        rows.append([
+            r["word"],
+            pron,
+            r.get("rhyme_type", ""),
+            r.get("score", 0.0),
+            r.get("why", ""),
+        ])
     return rows
 
 def do_search(*args):
