@@ -106,19 +106,53 @@ def _lev(a: tuple[str, ...], b: tuple[str, ...]) -> int:
             dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
     return dp[la][lb]
 
+# --- NEW: helpers for final-coda consonant rhyme ---
+def _last_vowel_idx(pron: List[str]) -> int:
+    """Index of the last vowel phone in the whole word; -1 if none."""
+    for i in range(len(pron) - 1, -1, -1):
+        p = pron[i]
+        core = p[:-1] if p and p[-1].isdigit() else p
+        if core in _VOWELS:
+            return i
+    return -1
+
+def _final_coda(pron: List[str]) -> tuple[str, ...]:
+    """Consonants strictly after the last vowel of the word (the true word ending)."""
+    j = _last_vowel_idx(pron)
+    if j == -1:
+        return ()
+    return tuple(p for p in pron[j+1:] if not _is_vowel(p))
+
 def classify_rhyme(pron_a: List[str], pron_b: List[str]) -> str:
-    if not pron_a or not pron_b: return "none"
+    if not pron_a or not pron_b:
+        return "none"
+
     tail_a, nuc_a, coda_a = _tail_parts(pron_a)
     tail_b, nuc_b, coda_b = _tail_parts(pron_b)
-    if not tail_a or not tail_b: return "none"
+    if not tail_a or not tail_b:
+        return "none"
+
+    # Perfect: identical normalized tails (vowel stress removed)
     norm_a, norm_b = _norm_tail(pron_a), _norm_tail(pron_b)
-    if norm_a == norm_b: return "perfect"
-    if coda_a and (tuple(_eqv(p) for p in coda_a) == tuple(_eqv(p) for p in coda_b)) and (nuc_a != nuc_b):
+    if norm_a == norm_b:
+        return "perfect"
+
+    # Consonant: same FINAL CODA (true word ending), different vowel nucleus
+    fc_a = tuple(_eqv(p) for p in _final_coda(pron_a))
+    fc_b = tuple(_eqv(p) for p in _final_coda(pron_b))
+    if fc_a and (fc_a == fc_b) and (nuc_a != nuc_b):
         return "consonant"
-    if (nuc_a == nuc_b) and (coda_a != coda_b): return "assonant"
+
+    # Assonant: same vowel nucleus, different coda (in the tail)
+    if (nuc_a == nuc_b) and (coda_a != coda_b):
+        return "assonant"
+
+    # Otherwise, allow a small edit distance on normalized tails as "slant"
     dist = _lev(norm_a, norm_b)
     max_len = max(len(norm_a), len(norm_b))
-    if max_len > 0 and (dist / max_len) <= 0.25: return "slant"
+    if max_len > 0 and (dist / max_len) <= 0.25:
+        return "slant"
+
     return "none"
 
 def tail_syllables(pron: List[str]) -> int:
@@ -206,7 +240,7 @@ def _candidates_by_tail_family(src_pron: List[str], limit_each: int = 400) -> Li
 def search_word(
     word: str,
     rhyme_type: str="any",
-    slant_strength: float=0.5,
+    slant_strength: float=0.5,  # reserved; currently used via edit-distance threshold
     syllable_min: int=1,
     syllable_max: int=8,
     max_results: int=150,
