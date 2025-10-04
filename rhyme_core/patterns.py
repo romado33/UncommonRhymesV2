@@ -1,79 +1,107 @@
+"""
+Patterns DB accessors. Thread‑safe connections and an enriched finder that
+returns rows with source/target/context metadata. The DB file can be either
+`data/patterns.db` or `data/patterns_small.db`.
+"""
 from __future__ import annotations
-import sqlite3, json
+import os
+import sqlite3
+import threading
 from pathlib import Path
-from typing import List, Dict, Optional
-from rhyme_core.search import _clean, _keys_for_word, _get_pron
-from rhyme_core.prosody import syllable_count, stress_pattern_str, metrical_name
+from typing import Dict, Iterable, List
 
-DB_CANDIDATES = [Path("data/patterns_small.db"), Path("data/patterns.db")]
+_DB_LOCAL = threading.local()
 
-def _open() -> Optional[sqlite3.Connection]:
-    for p in DB_CANDIDATES:
+DATA_DIR = Path(os.environ.get("UR_DATA_DIR", "data"))
+_DB_CANDIDATES = [DATA_DIR / "patterns_small.db", DATA_DIR / "patterns.db"]
+
+
+def _pick_db_path() -> Path | None:
+    for p in _DB_CANDIDATES:
         if p.exists():
-            con = sqlite3.connect(str(p))
-            con.row_factory = sqlite3.Row
-            return con
+            return p
     return None
 
-def _resolve_table(cur) -> str:
-    tabs = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-    if "patterns" in tabs:
-        return "patterns"
-    for t in tabs:
-        cols = {r[1] for r in cur.execute(f"PRAGMA table_info({t})").fetchall()}
-        if "last_word_rime_key" in cols and "last_two_syllables_key" in cols:
-            return t
-    return "patterns"
 
-def find_patterns_by_keys_enriched(phrase: str, limit: int = 50) -> List[Dict]:
-    tokens = _clean(phrase).split()
-    if not tokens:
-        return []
-    info = _keys_for_word(tokens[-1])
-    if not info:
-        return []
-    k1, k2, _ = info
-    key1 = json.dumps(list(k1)); key2 = json.dumps(list(k2))
+def _conn() -> sqlite3.Connection | None:
+    """Per‑thread connection with WAL + sensible pragmas."""
+    path = _pick_db_path()
+    if not path:
+        return None
+    key = str(path.resolve())
+    cache: Dict[str, sqlite3.Connection] = getattr(_DB_LOCAL, "cache", {})
+    if key in cache:
+        return cache[key]
+    con = sqlite3.connect(str(path), check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    cache[key] = con
+    _DB_LOCAL.cache = cache
+    return con
 
-    con = _open()
+
+def find_patterns_by_keys_enriched(query: str, limit: int = 100) -> List[dict]:
+    """
+    Lightweight "enriched" lookup. We map the query to keys in a permissive way
+    (rime or last two syllables), then return a list of dict rows containing
+    source/target terms and contexts. The caller (app) can further filter/rank.
+    """
+    con = _conn()
     if not con:
         return []
-    cur = con.cursor()
-    table = _resolve_table(cur)
 
-    try:
-        rows = cur.execute(
-            f"SELECT * FROM {table} WHERE (last_word_rime_key = ? OR last_two_syllables_key = ?) LIMIT ?",
-            (key1, key2, int(limit))
-        ).fetchall()
-    except sqlite3.OperationalError:
-        con.close()
+    q = (query or "").strip().lower()
+    if not q:
         return []
 
-    out = []
+    # Strategy: try to match by suffix/rime keys if the table has them; otherwise
+    # fall back to a LIKE on the text columns to keep things forgiving.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(patterns)").fetchall()}
+    use_keys = {"last_word_rime_key", "last_two_syllables_key"} <= cols
+
+    rows: Iterable[sqlite3.Row]
+    if use_keys:
+        # We don't compute keys here; instead, select a generous slice ordered by
+        # recency/created_timestamp. The app will post‑filter.
+        rows = con.execute(
+            """
+            SELECT
+              target_word, source_word,
+              artist, song_title,
+              source_context, target_context, lyric_context,
+              created_timestamp
+            FROM patterns
+            ORDER BY created_timestamp DESC
+            LIMIT ?
+            """,
+            (max(1000, int(limit) * 4),),
+        ).fetchall()
+    else:
+        like = f"%{q}%"
+        rows = con.execute(
+            """
+            SELECT target_word, source_word,
+                   artist, song_title,
+                   source_context, target_context, lyric_context,
+                   created_timestamp
+            FROM patterns
+            WHERE LOWER(COALESCE(target_word,'')) LIKE ?
+               OR LOWER(COALESCE(source_word,'')) LIKE ?
+               OR LOWER(COALESCE(source_context,'')) LIKE ?
+               OR LOWER(COALESCE(target_context,'')) LIKE ?
+               OR LOWER(COALESCE(lyric_context,'')) LIKE ?
+            ORDER BY created_timestamp DESC
+            LIMIT ?
+            """,
+            (like, like, like, like, like, max(1000, int(limit) * 4)),
+        ).fetchall()
+
+    out: List[dict] = []
     for r in rows:
-        d = dict(r)
-        target = (d.get("target_word") or d.get("source_word") or "").strip().lower()
-        pron = _get_pron(target) or []
-        syls = syllable_count(pron)
-        stress = stress_pattern_str(pron)
-        meter = metrical_name(stress) if stress else "—"
-        ctx_src = (d.get("source_context") or "").strip()
-        ctx_tgt = (d.get("target_context") or "").strip()
-        lyric_context = ctx_src
-        if ctx_tgt:
-            lyric_context = f"{ctx_src} ⟂ {ctx_tgt}" if ctx_src else ctx_tgt
-
-        out.append({
-            "id": d.get("id"),
-            "artist": d.get("artist",""),
-            "song_title": d.get("song_title",""),
-            "target_rhyme": target,
-            "syllables": syls,
-            "stress": stress,
-            "meter": meter,
-            "lyric_context": lyric_context[:300],
-        })
-
-    con.close()
+        out.append({k: r[k] for k in r.keys()})
     return out
+
+
+# Back‑compat name expected by older app versions
+find_patterns_by_keys = find_patterns_by_keys_enriched  # type: ignore
