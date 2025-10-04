@@ -1,15 +1,13 @@
 """
-Search helpers and CMU‑index lookup. This file exposes a minimal surface used
-by the app: `search_word(...)` plus utilities `_get_pron`, `_clean`,
-`classify_rhyme`, `_final_coda`, `_norm_tail`, `stress_pattern_str`,
-`syllable_count`.
+Search helpers and CMU‑index lookup. Public API:
+- search_word(...)
+- _get_pron, _clean
+- classify_rhyme, _final_coda, _norm_tail
+- stress_pattern_str, syllable_count
 
-Implementation notes:
-- We assume an SQLite `data/words_index.sqlite` with a `words(word, pron, syls,
-  k1, k2, rime_key, vowel_key, coda_key)` schema.
-- The rhyme classifier is conservative for "perfect" and requires matching
-  rime (vowel + coda). Slant allows shared vowel nucleus with different coda.
-- We keep the implementation compact and fast for Spaces.
+Relies on SQLite at data/words_index.sqlite with schema:
+  words(word TEXT PRIMARY KEY, pron TEXT JSON, syls INT,
+        k1 TEXT, k2 TEXT, rime_key TEXT, vowel_key TEXT, coda_key TEXT)
 """
 from __future__ import annotations
 import json
@@ -17,7 +15,7 @@ import re
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Iterable, List, Tuple
 
 DATA_DIR = Path("data")
 WORDS_DB = DATA_DIR / "words_index.sqlite"
@@ -25,6 +23,16 @@ WORDS_DB = DATA_DIR / "words_index.sqlite"
 _VOWELS = {"AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"}
 _STRIP_STRESS = re.compile(r"\d")
 _WORD_CLEAN = re.compile(r"[^a-z0-9\-\s']+")
+
+# Optional LLM OOV fallback
+try:
+    from llm.oov_g2p import infer_pron_arpabet  # type: ignore
+    from config import FLAGS as _FLAGS  # type: ignore
+except Exception:
+    infer_pron_arpabet = None
+    class _Dummy:
+        LLM_OOV_G2P = False
+    _FLAGS = _Dummy()
 
 # ---------------- Pron helpers ----------------
 
@@ -41,6 +49,14 @@ def _get_pron(word: str) -> List[str] | None:
     row = con.execute("SELECT pron FROM words WHERE word=?", (w,)).fetchone()
     con.close()
     if not row:
+        # OOV LLM fallback (flagged)
+        if getattr(_FLAGS, "LLM_OOV_G2P", False) and infer_pron_arpabet:
+            try:
+                arp = infer_pron_arpabet(w)
+                if arp:
+                    return arp
+            except Exception:
+                pass
         return None
     try:
         return json.loads(row["pron"]) or []
@@ -52,7 +68,6 @@ def _get_pron(word: str) -> List[str] | None:
 def stress_pattern_str(pron: List[str]) -> str:
     if not pron:
         return ""
-    # vowels (phonemes that end with a digit) carry stress number
     out = []
     for p in pron:
         m = re.search(r"(\d)$", p)
@@ -64,7 +79,7 @@ def stress_pattern_str(pron: List[str]) -> str:
 def syllable_count(pron: List[str]) -> int:
     if not pron:
         return 0
-    return sum(1 for p in pron if p[-1].isdigit())
+    return sum(1 for p in pron if p and p[-1].isdigit())
 
 # tail parsing
 
@@ -74,9 +89,7 @@ def _vowel_core(p: str) -> str:
 
 def _final_vowel_and_coda(pron: List[str]) -> Tuple[str, Tuple[str, ...]]:
     v = ""
-    coda: List[str] = []
     i = len(pron) - 1
-    # walk from end to find the last vowel nucleus
     while i >= 0:
         ph = pron[i]
         base = _vowel_core(ph)
@@ -84,8 +97,7 @@ def _final_vowel_and_coda(pron: List[str]) -> Tuple[str, Tuple[str, ...]]:
             v = base
             break
         i -= 1
-    # coda = trailing consonants after the final vowel
-    coda = [ _vowel_core(p) for p in pron[i+1:] ] if i >= 0 else []
+    coda = [_vowel_core(p) for p in pron[i+1:]] if i >= 0 else []
     return v, tuple(coda)
 
 
@@ -107,16 +119,14 @@ def classify_rhyme(qpron: List[str], cpron: List[str]) -> str:
     if qv == cv and qc == cc:
         return "perfect"
     if qv == cv and qc != cc:
-        return "assonant"  # share vowel nucleus
-    if qv != cv and qc == cc and qc:  # same coda
+        return "assonant"
+    if qv != cv and qc == cc and qc:
         return "consonant"
-    # rough slant if last phoneme matches
     return "slant" if (qpron and cpron and _vowel_core(qpron[-1]) == _vowel_core(cpron[-1])) else "none"
 
-# ---------------- Core search ----------------
+# ---------------- Candidate pool ----------------
 
 def _db_candidates_for_word(word: str) -> Iterable[sqlite3.Row]:
-    """Return a reasonably large pool using rime/vowel/coda buckets, then k1/k2."""
     w = _clean(word)
     con = sqlite3.connect(str(WORDS_DB))
     con.row_factory = sqlite3.Row
@@ -125,14 +135,13 @@ def _db_candidates_for_word(word: str) -> Iterable[sqlite3.Row]:
         con.close()
         return []
     rime, vow, coda, k1, k2 = row["rime_key"], row["vowel_key"], row["coda_key"], row["k1"], row["k2"]
-    rows: List[sqlite3.Row] = []
+    rows: list = []
     if rime:
         rows += con.execute("SELECT word,pron,syls FROM words WHERE rime_key=? LIMIT 600", (rime,)).fetchall()
     if vow:
         rows += con.execute("SELECT word,pron,syls FROM words WHERE vowel_key=? LIMIT 400", (vow,)).fetchall()
     if coda:
         rows += con.execute("SELECT word,pron,syls FROM words WHERE coda_key=? LIMIT 400", (coda,)).fetchall()
-    # fallback seeds
     if k1:
         rows += con.execute("SELECT word,pron,syls FROM words WHERE k1=? LIMIT 600", (k1,)).fetchall()
     if k2:
@@ -140,6 +149,7 @@ def _db_candidates_for_word(word: str) -> Iterable[sqlite3.Row]:
     con.close()
     return rows
 
+# ---------------- Core search ----------------
 
 def search_word(
     word: str,
@@ -173,12 +183,10 @@ def search_word(
         rtype = classify_rhyme(qpron, pron)
         if rhyme_type != "any" and rtype != rhyme_type:
             continue
-        # score: quality weight with minor slant tuning
         base = {"perfect": 1.0, "consonant": 0.9, "assonant": 0.86, "slant": 0.75, "none": 0.0}[rtype]
         if rtype == "slant":
-            # attenuate according to strength (0..1)
             base *= (0.5 + 0.5 * max(0.0, min(1.0, slant_strength)))
-        # prosody tie‑break inside score a little
+        # prosody tie-break baked into score a touch
         stress_equal = 1 if (stress_pattern_str(qpron) and stress_pattern_str(qpron) == stress_pattern_str(pron)) else 0
         score = base + 0.02 * stress_equal
         out.append({

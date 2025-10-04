@@ -21,6 +21,23 @@ try:
 except ImportError:  # legacy name
     from rhyme_core.patterns import find_patterns_by_keys
 
+# Optional LLM hooks (all no-op if modules/flags are absent)
+try:
+    from config import FLAGS as _FLAGS
+    from llm.rerank import rerank_candidates
+    from llm.phrase_gen import generate_phrases
+    from llm.patterns_semantic import pick_best_contexts
+    from llm.multiword_mining import mine_multiword_variants
+    from llm.nl_query import parse_query
+except Exception:
+    class _D:
+        LLM_RERANK=False; LLM_PHRASE_GEN=False; LLM_PATTERN_RERANK=False; LLM_MULTIWORD_MINE=False; LLM_NL_QUERY=False
+    _FLAGS=_D()
+    def rerank_candidates(*a, **k): return a[2] if len(a)>=3 else []
+    def generate_phrases(*a, **k): return []
+    def pick_best_contexts(*a, **k): return a[1] if len(a)>=2 else []
+    def mine_multiword_variants(*a, **k): return []
+    def parse_query(*a, **k): return {}
 
 # -----------------------
 # Helpers
@@ -75,13 +92,6 @@ def _in_syllable_bounds(pron, smin: int, smax: int) -> bool:
     return smin <= s <= smax
 
 
-def _stress(word_or_pron):
-    if isinstance(word_or_pron, list):
-        return stress_pattern_str(word_or_pron) or ""
-    pr = _get_pron(_clean(word_or_pron)) or []
-    return stress_pattern_str(pr) or ""
-
-
 def _prosody_bonus(query_pron, cand_pron):
     """Return tuple used for tie-breaks: (-stress_match, abs(syl_diff))."""
     qs = stress_pattern_str(query_pron) or ""
@@ -117,7 +127,6 @@ def _best_rhyme_choice(query_pron, target_word: str, source_word: str):
     choices.sort(reverse=True)
     return choices[0]
 
-
 # -----------------------
 # Core search (main tab)
 # -----------------------
@@ -135,7 +144,7 @@ def do_search(*args):
     rarity_min = float(rarity_min)
     query_summary = _query_summary(word)
 
-    # Pull pool (always include pron for prosody)
+    # Deterministic pool (always include pron for prosody)
     res = search_word(
         word,
         rhyme_type="any",
@@ -145,6 +154,13 @@ def do_search(*args):
         max_results=1000,
         include_pron=True,
     )
+
+    # Optional: natural-language parser (reserved; not wired to a text box yet)
+    try:
+        parsed = parse_query("") if _FLAGS.LLM_NL_QUERY else {}
+    except Exception:
+        parsed = {}
+    rhyme_type = rhyme_type or parsed.get("rhyme_type", "any")
 
     qpron = _get_pron(_clean(word)) or []
 
@@ -245,6 +261,15 @@ def do_search(*args):
         ),
     )[:50]
 
+    # LLM rerank (safe no-op if disabled)
+    if _FLAGS.LLM_RERANK:
+        try:
+            uncommon = rerank_candidates(word, qpron, uncommon)
+            slant_list = rerank_candidates(word, qpron, slant_list)
+            multiword = rerank_candidates(word, qpron, multiword)
+        except Exception:
+            pass
+
     # Build compact tables
     def as_rows(items, add_type: bool = False):
         rows = []
@@ -304,18 +329,27 @@ def do_search(*args):
 
             # group by default, cap per song
             MAX_PER_SONG = 3
+            ordered = []
             for (artist, song), rows in groups.items():
-                for row in rows[:MAX_PER_SONG]:
-                    patterns_rows.append(row)
+                if _FLAGS.LLM_PATTERN_RERANK:
+                    try:
+                        rows = pick_best_contexts(word, [
+                            {"Word": w, "Prosody": p, "Artist": a, "Song": s, "Context": c}
+                            for (w,p,a,s,c) in rows
+                        ], per_song=MAX_PER_SONG)
+                        rows = [[d["Word"], d["Prosody"], d["Artist"], d["Song"], d["Context"]] for d in rows]
+                    except Exception:
+                        pass
+                ordered.extend(rows[:MAX_PER_SONG])
+            patterns_rows = ordered
 
         except Exception:
             patterns_rows = []
 
-    return query_summary, row1_col1, row1_col2, row1_col3, patterns_rows
-
+    return _query_summary(word), row1_col1, row1_col2, row1_col3, patterns_rows
 
 # -----------------------
-# Reverse phrase search (beta) — lightweight CMU-only
+# Reverse phrase search (beta) — lightweight CMU-only + optional LLM variants
 # -----------------------
 
 def do_reverse(phrase: str, syl_min: int, syl_max: int):
@@ -338,10 +372,22 @@ def do_reverse(phrase: str, syl_min: int, syl_max: int):
         include_pron=True,
     )
     multi = [r for r in res if r.get("is_multiword")]
-    # compact rows
+
+    # Optionally mine extra variants via LLM and keep those that end in perfect rhyme
+    if getattr(_FLAGS, "LLM_MULTIWORD_MINE", False):
+        try:
+            extra = mine_multiword_variants(tail_word)
+            qpr = _get_pron(_clean(tail_word)) or []
+            for phrase in extra:
+                last = _clean(phrase.split()[-1])
+                cpr = _get_pron(last) or []
+                if classify_rhyme(qpr, cpr) == "perfect":
+                    multi.append({"word": phrase, "pron": cpr})
+        except Exception:
+            pass
+
     out = [[r["word"], _prosody_compact(r.get("pron") or [])] for r in multi[:100]]
     return out
-
 
 # -----------------------
 # UI (two tabs)
