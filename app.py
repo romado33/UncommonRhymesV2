@@ -26,17 +26,19 @@ def _prosody_row_from_pron(word: str, pron):
 def do_search(*args):
     """
     Back-compat handler:
-      - 5 args:  word, rhyme_type, slant, syl_min, syl_max
-      - 8 args:  word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit
+      - 6 args:  word, rhyme_type, slant, syl_min, syl_max, rarity_min
+      - 9 args:  word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min
     """
-    if len(args) == 5:
-        word, rhyme_type, slant, syl_min, syl_max = args
+    if len(args) == 6:
+        word, rhyme_type, slant, syl_min, syl_max, rarity_min = args
         phrase = ""
         patterns_limit = 50
-    elif len(args) == 8:
-        word, phrase, rhyme_type, slant, syl_min, syl_max, _include_pron, patterns_limit = args
+    elif len(args) == 9:
+        word, phrase, rhyme_type, slant, syl_min, syl_max, _include_pron, patterns_limit, rarity_min = args
     else:
         raise ValueError(f"Unexpected number of inputs: {len(args)}")
+
+    rarity_min = float(rarity_min)
 
     # Pull a full pool and ALWAYS include pronunciations so we can compute prosody.
     res = search_word(
@@ -49,34 +51,90 @@ def do_search(*args):
         include_pron=True,
     )
 
-    # Split into Uncommon (rare perfects), Slant (non-perfect), Multi-word (space/hyphen).
+    # --- split & curate ---
+
+    def _rhyme_quality(rtype: str) -> float:
+        # mirrors search.py’s weights; perfect highest
+        return {"perfect": 1.0, "consonant": 0.9, "assonant": 0.85, "slant": 0.75}.get(rtype, 0.0)
+
+    def _tail_key_from_pron(pron):
+        # collapse vowels to core (no stress) so we can dedupe similar tails
+        from rhyme_core.search import _norm_tail
+        try:
+            return tuple(_norm_tail(pron or []))
+        except Exception:
+            return ()
+
+    # Buckets for the first row
     uncommon, slant_list, multiword = [], [], []
+
     for r in res:
         w_cand = r["word"]
-        rar = _rarity(w_cand)
-        rt = r.get("rhyme_type", "")
-        if rt == "perfect" and rar >= 0.45:
-            uncommon.append((rar, r))
-        if rt != "perfect":
+        rt = (r.get("rhyme_type") or "").lower()
+        sc = float(r.get("score", 0.0))
+        is_multi = bool(r.get("is_multiword"))
+
+        # Slant = anything not perfect (or clearly < 1.0 match)
+        if rt != "perfect" or sc < 0.999:
             slant_list.append(r)
-        if (" " in w_cand) or ("-" in w_cand):
+
+        # Multi-word = orthographic multi (space / hyphen)
+        if is_multi:
             multiword.append(r)
 
-    # Sort & cap
-    uncommon = [r for _, r in sorted(uncommon, key=lambda x: (-x[0], x[1]["word"]))][:20]
+    # ---- curate “Uncommon” (aim ~20) ----
+    single_word = [r for r in res if not r.get("is_multiword")]
+    perfect_rare = [
+        r for r in single_word
+        if (r.get("rhyme_type","").startswith("perfect") and _rarity(r["word"]) >= rarity_min)
+    ]
+
+    # backfill with rare, strong consonant/assonant if needed
+    backfill = []
+    if len(perfect_rare) < 20:
+        bf = [
+            r for r in single_word
+            if (r.get("rhyme_type") in ("consonant", "assonant")
+                and _rarity(r["word"]) >= (rarity_min + 0.10))
+        ]
+        bf = [r for r in bf if _rhyme_quality(r.get("rhyme_type","")) * float(r.get("score",0.0)) >= 0.55]
+        backfill = bf
+
+    curation_pool = perfect_rare + backfill
+
+    # de-dupe by normalized tail
+    seen_tails = set()
+    curated = []
+    for r in sorted(
+        curation_pool,
+        key=lambda x: (-_rarity(x["word"]), -float(x.get("score",0.0)), x["word"])
+    ):
+        tkey = _tail_key_from_pron(r.get("pron") or [])
+        if tkey in seen_tails:
+            continue
+        seen_tails.add(tkey)
+        curated.append(r)
+        if len(curated) >= 20:
+            break
+    uncommon = curated
+
+    # final sorts/caps for other two columns
     slant_list = sorted(slant_list, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50]
     multiword = sorted(multiword, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50]
 
-    # Build row-1 tables: Target Rhyme, Syllables, #-Pattern, Metrical Name
-    def as_rows(items):
+    # Build row-1 tables: add "Type" to Slant column
+    def as_rows(items, add_type=False):
         rows = []
         for r in items:
-            rows.append(_prosody_row_from_pron(r["word"], r.get("pron") or []))
+            base = _prosody_row_from_pron(r["word"], r.get("pron") or [])
+            if add_type:
+                base = base + [r.get("rhyme_type","")]
+            rows.append(base)
         return rows
 
-    row1_col1 = as_rows(uncommon)
-    row1_col2 = as_rows(slant_list)
-    row1_col3 = as_rows(multiword)
+    row1_col1 = as_rows(uncommon)                        # Uncommon
+    row1_col2 = as_rows(slant_list, add_type=True)       # Slant + Type
+    row1_col3 = as_rows(multiword)                       # Multi-word
 
     # Row 2: Patterns DB (target rhyme + prosody + artist/song/context)
     query_for_patterns = (phrase or word).strip()
@@ -124,7 +182,7 @@ with gr.Blocks() as demo:
 
     gr.Markdown("# Uncommon Rhymes V2 — prosody outputs")
 
-    # Inputs (8 widgets). We bind both 5-arg and 8-arg signatures for cached clients.
+    # Inputs (9 widgets). We bind both 6-arg and 9-arg signatures for cached clients.
     with gr.Row():
         word = gr.Textbox(label="Word", placeholder="sister")
         phrase = gr.Textbox(label="Phrase for patterns (optional)", placeholder="him so")
@@ -135,6 +193,7 @@ with gr.Blocks() as demo:
         syl_max = gr.Slider(1, 12, value=8, step=1, label="Max syllables")
         include_pron = gr.Checkbox(value=False, label="(unused) Show pronunciations")
         patterns_limit = gr.Slider(5, 200, value=50, step=5, label="Patterns max rows")
+        rarity_min = gr.Slider(0.30, 0.70, value=0.42, step=0.01, label="Rarity ≥ (uncommon filter)")
 
     btn = gr.Button("Search", variant="primary")
 
@@ -147,8 +206,8 @@ with gr.Blocks() as demo:
             wrap=True
         )
         out_slant = gr.Dataframe(
-            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name"],
-            datatype=["str", "number", "str", "str"],
+            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name", "Type"],
+            datatype=["str", "number", "str", "str", "str"],
             label="Slant Rhymes",
             wrap=True
         )
@@ -168,15 +227,15 @@ with gr.Blocks() as demo:
             wrap=True
         )
 
-    # Bind both 5-arg and 8-arg signatures (compat with cached UIs)
+    # Bind both 6-arg and 9-arg signatures (compat with cached UIs)
     btn.click(
         do_search,
-        [word, rhyme_type, slant, syl_min, syl_max],
+        [word, rhyme_type, slant, syl_min, syl_max, rarity_min],
         [out_uncommon, out_slant, out_multi, out_patterns]
     )
     btn.click(
         do_search,
-        [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit],
+        [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min],
         [out_uncommon, out_slant, out_multi, out_patterns]
     )
 

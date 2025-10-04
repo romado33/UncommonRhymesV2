@@ -4,12 +4,14 @@ from functools import lru_cache
 from typing import List, Tuple, Dict
 from unidecode import unidecode
 from wordfreq import zipf_frequency
-
-# Removed dependency on .scoring.classify; we classify locally now.
 from .phonetics import key_k1, key_k2
 
-# Accept letters with optional apostrophes / hyphens / spaces.
-# Reject anything starting with punctuation (e.g. ")close-parentheses").
+# Optional OOV fallback
+try:
+    from g2p_en import G2p
+except Exception:
+    G2p = None
+
 VALID_WORD_RE = re.compile(r"^[a-z][a-z'\- ]*$")
 
 def _clean(text: str) -> str:
@@ -21,36 +23,46 @@ def _db() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     return con
 
-def _get_pron(word: str) -> List[str] | None:
-    row = _db().execute("SELECT pron FROM words WHERE word=?", (word,)).fetchone()
-    return json.loads(row["pron"]) if row else None
-
-def _keys_for_word(word: str):
-    phones = _get_pron(word)
-    if not phones:
-        return None
-    return tuple(key_k1(phones)), tuple(key_k2(phones)), tuple(phones)
-
-def _candidates_by_key(key_col: str, key: Tuple[str,...], limit: int=500) -> List[Dict]:
-    key_json = json.dumps(list(key))
-    rows = _db().execute(
-        f"SELECT word, pron, syls FROM words WHERE {key_col}=? LIMIT ?",
-        (key_json, limit)
-    ).fetchall()
-    return [{"word": r["word"], "pron": json.loads(r["pron"]), "syls": r["syls"]} for r in rows]
-
+# ---------- rarity ----------
 def _rarity_score(word: str) -> float:
     z = zipf_frequency(word, "en")
     z = max(0.0, min(8.0, z))
     return (8.0 - z) / 8.0
 
-# ---------------------------
-# Phoneme-level classifier
-# ---------------------------
+# ---------- g2p ----------
+@lru_cache(maxsize=1)
+def _g2p():
+    return G2p() if G2p is not None else None
 
+def _g2p_fallback(word_or_phrase: str) -> list[str] | None:
+    g2p = _g2p()
+    if not g2p:
+        return None
+    toks = g2p(word_or_phrase)
+    phones = []
+    for t in toks:
+        t = t.strip()
+        if not t:
+            continue
+        if any(ch.isdigit() for ch in t) or t.isalpha():
+            phones.append(t.upper())
+    out = [re.sub(r"[^A-Z0-9]", "", p) for p in phones if re.match(r"^[A-Z]{1,3}\d?$", p)]
+    return out or None
+
+# ---------- vowels / tails / classifier ----------
 _VOWELS = {
     "AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"
 }
+
+_EQV = {  # voicing equivalence for consonant-only check
+    "S":"Z", "Z":"Z",
+    "T":"D", "D":"D",
+    "K":"G", "G":"G",
+    "P":"B", "B":"B",
+    "F":"V", "V":"V",
+    "CH":"JH", "JH":"JH",
+}
+def _eqv(p: str) -> str: return _EQV.get(p, p)
 
 def _is_vowel(p: str) -> bool:
     core = p[:-1] if p and p[-1].isdigit() else p
@@ -63,42 +75,26 @@ def _vowel_core(p: str) -> str:
     return (p[:-1] if p and p[-1].isdigit() else p)
 
 def _tail_parts(pron: List[str]) -> tuple[list[str], str, tuple[str, ...]]:
-    """
-    Return (tail, vowel_core, coda_tuple)
-    - tail: list from last stressed vowel (1/2) else last vowel to end
-    - vowel_core: e.g. 'IH' for 'IH1'
-    - coda: tuple of consonants after that vowel within the tail
-    """
     if not pron:
         return [], "", ()
     idx = -1
-    # last stressed vowel (1/2)
     for i in range(len(pron)-1, -1, -1):
         if _is_vowel(pron[i]) and _stress_digit(pron[i]) in (1, 2):
-            idx = i
-            break
-    # else last vowel
+            idx = i; break
     if idx == -1:
         for i in range(len(pron)-1, -1, -1):
-            if _is_vowel(pron[i]):
-                idx = i
-                break
-    if idx == -1:
-        return [], "", ()
+            if _is_vowel(pron[i]): idx = i; break
+    if idx == -1: return [], "", ()
     tail = pron[idx:]
-    nuc = _vowel_core(pron[idx])
+    nuc  = _vowel_core(pron[idx])
     coda = tuple(p for p in tail[1:] if not _is_vowel(p))
     return tail, nuc, coda
 
 def _norm_tail(pron: List[str]) -> tuple[str, ...]:
-    """Normalize a tail by stripping stress digits from vowels."""
     tail, _, _ = _tail_parts(pron)
     norm: list[str] = []
     for p in tail:
-        if _is_vowel(p):
-            norm.append(_vowel_core(p))
-        else:
-            norm.append(p)
+        norm.append(_vowel_core(p) if _is_vowel(p) else p)
     return tuple(norm)
 
 def _lev(a: tuple[str, ...], b: tuple[str, ...]) -> int:
@@ -107,38 +103,22 @@ def _lev(a: tuple[str, ...], b: tuple[str, ...]) -> int:
     for i in range(1, la+1):
         for j in range(1, lb+1):
             cost = 0 if a[i-1] == b[j-1] else 1
-            dp[i][j] = min(
-                dp[i-1][j] + 1,
-                dp[i][j-1] + 1,
-                dp[i-1][j-1] + cost,
-            )
+            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
     return dp[la][lb]
 
 def classify_rhyme(pron_a: List[str], pron_b: List[str]) -> str:
-    """
-    Return 'perfect' | 'consonant' | 'assonant' | 'slant' | 'none'
-    """
-    if not pron_a or not pron_b:
-        return "none"
+    if not pron_a or not pron_b: return "none"
     tail_a, nuc_a, coda_a = _tail_parts(pron_a)
     tail_b, nuc_b, coda_b = _tail_parts(pron_b)
-    if not tail_a or not tail_b:
-        return "none"
-
+    if not tail_a or not tail_b: return "none"
     norm_a, norm_b = _norm_tail(pron_a), _norm_tail(pron_b)
-
-    if norm_a == norm_b:
-        return "perfect"
-    if coda_a and (coda_a == coda_b) and (nuc_a != nuc_b):
+    if norm_a == norm_b: return "perfect"
+    if coda_a and (tuple(_eqv(p) for p in coda_a) == tuple(_eqv(p) for p in coda_b)) and (nuc_a != nuc_b):
         return "consonant"
-    if (nuc_a == nuc_b) and (coda_a != coda_b):
-        return "assonant"
-
-    # near on normalized tails => slant
+    if (nuc_a == nuc_b) and (coda_a != coda_b): return "assonant"
     dist = _lev(norm_a, norm_b)
     max_len = max(len(norm_a), len(norm_b))
-    if max_len > 0 and (dist / max_len) <= 0.25:
-        return "slant"
+    if max_len > 0 and (dist / max_len) <= 0.25: return "slant"
     return "none"
 
 def tail_syllables(pron: List[str]) -> int:
@@ -148,14 +128,85 @@ def tail_syllables(pron: List[str]) -> int:
 def is_multiword(word: str) -> bool:
     return (" " in word) or ("-" in word)
 
-# ---------------------------
-# Search
-# ---------------------------
+# ---------- pronunciations ----------
+def _get_pron_all(word: str) -> list[list[str]]:
+    row = _db().execute("SELECT pron FROM words WHERE word=?", (word,)).fetchone()
+    prons = []
+    if row:
+        try:
+            pr = json.loads(row["pron"])
+            if isinstance(pr, list) and pr and isinstance(pr[0], str):
+                prons.append(pr)
+            elif isinstance(pr, list) and pr and isinstance(pr[0], list):
+                prons.extend(pr)
+        except Exception:
+            pass
+    if not prons:
+        gp = _g2p_fallback(word)
+        if gp: prons.append(gp)
+    return prons
 
+def _best_match_pron(base_pron: list[str], cand_prons: list[list[str]]) -> list[str] | None:
+    best, best_q = None, -1.0
+    for cp in cand_prons:
+        rtype = classify_rhyme(base_pron, cp)
+        q = {"perfect":1.0,"consonant":0.9,"assonant":0.85,"slant":0.75,"none":0.0}.get(rtype, 0.0)
+        if q > best_q: best_q, best = q, cp
+    return best
+
+def _keys_for_word(word: str):
+    prons = _get_pron_all(word)
+    if not prons: return None
+    best = max(prons, key=lambda p: len(_norm_tail(p)))
+    return tuple(key_k1(best)), tuple(key_k2(best)), tuple(best)
+
+# legacy helper used by app’s patterns fallback
+def _get_pron(word: str) -> list[str]:
+    pr = _get_pron_all(word)
+    return pr[0] if pr else []
+
+# ---------- candidate pools ----------
+def _candidates_by_key(key_col: str, key: Tuple[str,...], limit: int=500) -> List[Dict]:
+    key_json = json.dumps(list(key))
+    rows = _db().execute(
+        f"SELECT word, pron, syls FROM words WHERE {key_col}=? LIMIT ?",
+        (key_json, limit)
+    ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append({"word": r["word"], "pron": json.loads(r["pron"]), "syls": r["syls"]})
+        except Exception:
+            out.append({"word": r["word"], "pron": [], "syls": r["syls"]})
+    return out
+
+def _q(sql: str, args: tuple, limit: int) -> list[sqlite3.Row]:
+    return _db().execute(sql + " LIMIT ?", (*args, limit)).fetchall()
+
+def _candidates_by_tail_family(src_pron: List[str], limit_each: int = 400) -> List[Dict]:
+    tail, vowel, coda = _tail_parts(src_pron)
+    if not tail: return []
+    rime = json.dumps(list(_norm_tail(src_pron)))
+    coda_json = json.dumps(list(coda))
+    rows = []
+    rows += _q("SELECT word, pron, syls FROM words WHERE rime_key = ?", (rime,), limit_each)
+    rows += _q("SELECT word, pron, syls FROM words WHERE coda_key = ? AND vowel_key <> ?",
+               (coda_json, vowel), limit_each)
+    rows += _q("SELECT word, pron, syls FROM words WHERE vowel_key = ? AND rime_key <> ?",
+               (vowel, rime), limit_each)
+    out: List[Dict] = []
+    for r in rows:
+        try:
+            out.append({"word": r["word"], "pron": json.loads(r["pron"]), "syls": r["syls"]})
+        except Exception:
+            out.append({"word": r["word"], "pron": [], "syls": r["syls"]})
+    return out
+
+# ---------- search ----------
 def search_word(
     word: str,
     rhyme_type: str="any",
-    slant_strength: float=0.5,   # reserved for future weighting
+    slant_strength: float=0.5,
     syllable_min: int=1,
     syllable_max: int=8,
     max_results: int=150,
@@ -165,48 +216,48 @@ def search_word(
 ) -> List[Dict]:
     w = _clean(word)
     info = _keys_for_word(w)
-    if not info:
-        return []
+    if not info: return []
     k1, k2, src_pron = info
-    # We still use keys for candidate recall:
-    pool = _candidates_by_key("k1", k1, 800) + _candidates_by_key("k2", k2, 800)
+
+    # Prefer tail-family pools for targeted recall
+    pool = _candidates_by_tail_family(list(src_pron), limit_each=400)
+    if len(pool) < 200:   # fallback to legacy keys if sparse
+        pool += _candidates_by_key("k1", k1, 800)
+        pool += _candidates_by_key("k2", k2, 800)
 
     seen, filtered = set(), []
     for c in pool:
         w_cand = c["word"]
-        if w_cand == w:
-            continue
-        if not (syllable_min <= c["syls"] <= syllable_max):
-            continue
-        if not VALID_WORD_RE.match(w_cand):
-            continue
-        if w_cand in seen:
-            continue
+        if w_cand == w: continue
+        if not (syllable_min <= c["syls"] <= syllable_max): continue
+        if not VALID_WORD_RE.match(w_cand): continue
+        if w_cand in seen: continue
         seen.add(w_cand)
         filtered.append(c)
 
     results: List[Dict] = []
     for c in filtered:
-        rtype = classify_rhyme(list(src_pron), c["pron"])
-        if rhyme_type != "any" and rtype != rhyme_type:
-            continue
+        cand_word = c["word"]
+        cand_pron = c["pron"] or _g2p_fallback(cand_word) or []
+        best_cand_pron = _best_match_pron(list(src_pron), [cand_pron] or [])
+        if not best_cand_pron: continue
 
-        # “multisyllabic tail” (phonetic multi), and “multiword” (orthographic multi)
-        tail_multi = tail_syllables(c["pron"]) >= 2
-        orth_multi = is_multiword(c["word"])
+        rtype = classify_rhyme(list(src_pron), best_cand_pron)
+        if rhyme_type != "any" and rtype != rhyme_type: continue
 
-        # quality weighting; bump a little for multisyllabic tails
+        tail_multi = tail_syllables(best_cand_pron) >= 2
+        orth_multi = is_multiword(cand_word)
+
         rhyme_q_map = {"perfect":1.0, "assonant":0.85, "consonant":0.9, "slant":0.75, "none":0.0}
         rhyme_q = rhyme_q_map.get(rtype, 0.0)
-        if tail_multi:
-            rhyme_q = min(rhyme_q + 0.05, 1.1)
+        if tail_multi: rhyme_q = min(rhyme_q + 0.05, 1.1)
 
-        rar = _rarity_score(c["word"])
+        rar = _rarity_score(cand_word)
         score = weight_quality * rhyme_q + weight_rarity * rar
 
         results.append({
-            "word": c["word"],
-            "pron": c["pron"] if include_pron else None,
+            "word": cand_word,
+            "pron": best_cand_pron if include_pron else None,
             "syls": c["syls"],
             "rhyme_type": ("multisyllabic "+rtype) if (tail_multi and rtype=="perfect") else rtype,
             "is_multiword": orth_multi,
@@ -219,8 +270,7 @@ def search_word(
 
 def search_phrase_to_words(phrase: str, **kwargs) -> List[Dict]:
     parts = _clean(phrase).split()
-    if not parts:
-        return []
+    if not parts: return []
     last = parts[-1]
     return search_word(last, **kwargs)
 
