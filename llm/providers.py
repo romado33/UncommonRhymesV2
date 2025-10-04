@@ -70,7 +70,7 @@ def complete_lines(prompt: str, n: int = 10, temperature: float = 0.7) -> List[s
                 max_new_tokens=min(FLAGS.MAX_TOKENS, 512),
                 temperature=temperature,
             )
-        out = [l.strip(" \n\r\t-•") for l in txt.splitlines()]
+        out = [l.strip(" \n\r\t-â€¢") for l in txt.splitlines()]
         return [l for l in out if l][:n]
     except Exception:
         return []
