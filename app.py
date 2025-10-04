@@ -22,6 +22,7 @@ except ImportError:  # legacy name
 # -----------------------
 # Helpers
 # -----------------------
+
 def _rarity(word: str) -> float:
     """Return 0..1 rarity (1 = very rare), based on Zipf frequency."""
     z = zipf_frequency(word, "en")
@@ -118,6 +119,7 @@ def _best_rhyme_choice(query_pron, target_word: str, source_word: str):
 # -----------------------
 # Core handler
 # -----------------------
+
 def do_search(*args):
     """
     Back-compat handler:
@@ -148,67 +150,72 @@ def do_search(*args):
         include_pron=True,
     )
 
-    # --- split & curate ---
-
-    def _rhyme_quality(rtype: str) -> float:
-        # mirrors search.py’s weights; perfect highest
-        return {"perfect": 1.0, "consonant": 0.9, "assonant": 0.85, "slant": 0.75}.get(rtype, 0.0)
-
-    def _tail_key_from_pron(pron):
-        # collapse vowels to core (no stress) so we can dedupe similar tails
-        try:
-            return tuple(_norm_tail(pron or []))
-        except Exception:
-            return ()
-
-    # Buckets for the first row
-    uncommon, slant_list, multiword = [], [], []
-
+    # --- split ---
+    slant_list, multiword = [], []
     for r in res:
         rt = (r.get("rhyme_type") or "").lower()
         sc = float(r.get("score", 0.0))
-
-        # Slant = anything not perfect (or clearly < 1.0 match)
         if rt != "perfect" or sc < 0.999:
             slant_list.append(r)
-
-        # Multi-word = orthographic multi (space / hyphen)
         if r.get("is_multiword"):
             multiword.append(r)
 
-    # ---- curate “Uncommon” (aim ~20) ----
+    # ---- curate “Uncommon” (aim ~20) with adaptive fallback ----
+    TARGET_N = 20
     single_word = [r for r in res if not r.get("is_multiword")]
-    perfect_rare = [
-        r for r in single_word
-        if (r.get("rhyme_type", "").startswith("perfect") and _rarity(r["word"]) >= rarity_min)
-    ]
 
-    # backfill with rare, strong consonant/assonant if needed
+    # All perfects (for fallback), and “rare perfects” per slider
+    perfect_all = [r for r in single_word if (r.get("rhyme_type", "").startswith("perfect"))]
+    rare_perfects = [r for r in perfect_all if _rarity(r["word"]) >= rarity_min]
+
+    # If not enough rare perfects, fill with the least-common perfects regardless of threshold
+    fallback_perfects = []
+    if len(rare_perfects) < TARGET_N:
+        need = TARGET_N - len(rare_perfects)
+        ranked_perfects = sorted(
+            perfect_all,
+            key=lambda x: (-_rarity(x["word"]), -float(x.get("score", 0.0)), x["word"])
+        )
+        seen_words = {r["word"] for r in rare_perfects}
+        for r in ranked_perfects:
+            if r["word"] in seen_words:
+                continue
+            fallback_perfects.append(r)
+            seen_words.add(r["word"])
+            if len(fallback_perfects) >= need:
+                break
+
+    # If STILL short, allow rare strong assonant/consonant as backfill
     backfill = []
-    if len(perfect_rare) < 20:
-        bf = [
+    if len(rare_perfects) + len(fallback_perfects) < TARGET_N:
+        need = TARGET_N - (len(rare_perfects) + len(fallback_perfects))
+        strong_slants = [
             r for r in single_word
-            if (r.get("rhyme_type") in ("consonant", "assonant")
-                and _rarity(r["word"]) >= (rarity_min + 0.10))
+            if (r.get("rhyme_type") in ("consonant", "assonant"))
+            and _rarity(r["word"]) >= max(0.0, rarity_min - 0.10)
+            and ({"perfect": 1.0, "consonant": 0.9, "assonant": 0.85}.get(r.get("rhyme_type", ""), 0) * float(r.get("score", 0.0)) >= 0.55)
         ]
-        bf = [r for r in bf if _rhyme_quality(r.get("rhyme_type", "")) * float(r.get("score", 0.0)) >= 0.55]
-        backfill = bf
+        strong_slants = sorted(
+            strong_slants,
+            key=lambda x: (-_rarity(x["word"]), -float(x.get("score", 0.0)), x["word"])
+        )[:need]
+        backfill = strong_slants
 
-    curation_pool = perfect_rare + backfill
+    # Assemble and de-dup by normalized tail
+    curation_pool = rare_perfects + fallback_perfects + backfill
 
-    # de-dupe by normalized tail
     seen_tails = set()
     curated = []
     for r in sorted(
         curation_pool,
         key=lambda x: (-_rarity(x["word"]), -float(x.get("score", 0.0)), x["word"])
     ):
-        tkey = _tail_key_from_pron(r.get("pron") or [])
+        tkey = tuple(_norm_tail(r.get("pron") or []))
         if tkey in seen_tails:
             continue
         seen_tails.add(tkey)
         curated.append(r)
-        if len(curated) >= 20:
+        if len(curated) >= TARGET_N:
             break
     uncommon = curated
 
@@ -227,7 +234,7 @@ def do_search(*args):
                 rows.append([r["word"], prosody])
         return rows
 
-    row1_col1 = as_rows(uncommon)                        # Uncommon Perfect (+rare backfill)
+    row1_col1 = as_rows(uncommon)                        # Uncommon Perfect (+rare/least-common/backfill)
     row1_col2 = as_rows(slant_list, add_type=True)       # Slant + Type
     row1_col3 = as_rows(multiword)                       # Multi-word
 
@@ -307,7 +314,8 @@ with gr.Blocks() as demo:
         syl_max = gr.Slider(1, 12, value=8, step=1, label="Max syllables")
         include_pron = gr.Checkbox(value=False, label="(unused) Show pronunciations")
         patterns_limit = gr.Slider(5, 200, value=50, step=5, label="Patterns max rows")
-        rarity_min = gr.Slider(0.30, 0.70, value=0.42, step=0.01, label="Rarity ≥ (uncommon filter)")
+        # Default lowered to 0.30 so more perfects show by default
+        rarity_min = gr.Slider(0.20, 0.70, value=0.30, step=0.01, label="Rarity ≥ (uncommon filter)")
 
     summary_md = gr.Markdown("—")  # top summary line
 
