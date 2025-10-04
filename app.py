@@ -1,4 +1,3 @@
-# app.py
 import gradio as gr
 from pathlib import Path
 from wordfreq import zipf_frequency
@@ -37,6 +36,29 @@ def _prosody_row_from_pron(word: str, pron):
     stress = stress_pattern_str(p)
     meter = metrical_name(stress) if stress else "—"
     return [word, syls, stress, meter]
+
+
+def _prosody_compact(pron) -> str:
+    """Return 'S • Stress • Metre' compact string."""
+    p = pron or []
+    s = syllable_count(p)
+    sp = stress_pattern_str(p) or "—"
+    m = metrical_name(sp) if sp and sp != "—" else "—"
+    return f"{s} • {sp} • {m}"
+
+
+def _query_summary(word: str) -> str:
+    """One-line summary for the top of the UI."""
+    w = _clean(word or "")
+    if not w:
+        return "—"
+    pr = _get_pron(w) or []
+    if not pr:
+        return f"**{w}**: (no pronunciation found)"
+    s = syllable_count(pr)
+    sp = stress_pattern_str(pr) or "—"
+    m = metrical_name(sp) if sp and sp != "—" else "—"
+    return f"**{w}** · **{s}** syllables · stress **{sp}** · metre **{m}**"
 
 
 def _mark_ctx(text: str, target: str, source: str) -> str:
@@ -112,6 +134,8 @@ def do_search(*args):
         raise ValueError(f"Unexpected number of inputs: {len(args)}")
 
     rarity_min = float(rarity_min)
+
+    query_summary = _query_summary(word)
 
     # Pull a full pool and ALWAYS include pronunciations so we can compute prosody.
     res = search_word(
@@ -192,14 +216,15 @@ def do_search(*args):
     slant_list = sorted(slant_list, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50]
     multiword = sorted(multiword, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50]
 
-    # Build row-1 tables: add "Type" to Slant column
+    # Build row-1 tables (COMPACT): [Word, Prosody] and Slant adds Type
     def as_rows(items, add_type: bool = False):
         rows = []
         for r in items:
-            base = _prosody_row_from_pron(r["word"], r.get("pron") or [])
+            prosody = _prosody_compact(r.get("pron") or [])
             if add_type:
-                base = base + [r.get("rhyme_type", "")]
-            rows.append(base)
+                rows.append([r["word"], prosody, (r.get("rhyme_type") or "")])
+            else:
+                rows.append([r["word"], prosody])
         return rows
 
     row1_col1 = as_rows(uncommon)                        # Uncommon Perfect (+rare backfill)
@@ -207,7 +232,7 @@ def do_search(*args):
     row1_col3 = as_rows(multiword)                       # Multi-word
 
     # -----------------------
-    # Row 2: Patterns DB
+    # Row 2: Patterns DB (compact)
     # -----------------------
     query_for_patterns = (phrase or word).strip()
     patterns_rows = []
@@ -232,9 +257,7 @@ def do_search(*args):
                 if not _in_syllable_bounds(chosen_pr, int(syl_min), int(syl_max)):
                     continue
 
-                # prosody for the chosen term
-                base = _prosody_row_from_pron(chosen_word, chosen_pr)
-
+                prosody = _prosody_compact(chosen_pr)
                 artist = d.get("artist", "")
                 song = d.get("song_title", "")
 
@@ -244,15 +267,17 @@ def do_search(*args):
                 context = ctx_src
                 if ctx_tgt:
                     context = f"{ctx_src} ⟂ {ctx_tgt}" if ctx_src else ctx_tgt
-                context = _mark_ctx(context, tgt, src)[:400]
+                context = _mark_ctx(context, tgt, src).replace("\n", " ")
+                if len(context) > 140:
+                    context = context[:137] + "…"
 
-                patterns_rows.append(base + [artist, song, context])
+                patterns_rows.append([chosen_word, prosody, artist, song, context])
 
         except Exception:
             patterns_rows = []
 
-    # always return all four tables
-    return row1_col1, row1_col2, row1_col3, patterns_rows
+    # always return summary + three columns + patterns
+    return query_summary, row1_col1, row1_col2, row1_col3, patterns_rows
 
 
 # -----------------------
@@ -268,7 +293,7 @@ with gr.Blocks() as demo:
     msgs.append("ℹ️ **Patterns DB**: found." if has_patterns else "ℹ️ **Patterns DB not present (optional)**.")
     gr.Markdown("\n".join(msgs))
 
-    gr.Markdown("# Uncommon Rhymes V2 — prosody outputs")
+    gr.Markdown("# Uncommon Rhymes V2 — prosody outputs (compact)")
 
     # Inputs (9 widgets). We bind both 6-arg and 9-arg signatures for cached clients.
     with gr.Row():
@@ -284,48 +309,49 @@ with gr.Blocks() as demo:
         patterns_limit = gr.Slider(5, 200, value=50, step=5, label="Patterns max rows")
         rarity_min = gr.Slider(0.30, 0.70, value=0.42, step=0.01, label="Rarity ≥ (uncommon filter)")
 
-    btn = gr.Button("Search", variant="primary")
+    summary_md = gr.Markdown("—")  # top summary line
 
-    # Row 1: three columns with prosodic info
+    # Row 1: three compact tables
     with gr.Row():
         out_uncommon = gr.Dataframe(
-            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name"],
-            datatype=["str", "number", "str", "str"],
+            headers=["Word", "Prosody"],
+            datatype=["str", "str"],
             label="Uncommon Rhymes (curated ~20)",
             wrap=True
         )
         out_slant = gr.Dataframe(
-            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name", "Type"],
-            datatype=["str", "number", "str", "str", "str"],
+            headers=["Word", "Prosody", "Type"],
+            datatype=["str", "str", "str"],
             label="Slant Rhymes",
             wrap=True
         )
         out_multi = gr.Dataframe(
-            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name"],
-            datatype=["str", "number", "str", "str"],
+            headers=["Word", "Prosody"],
+            datatype=["str", "str"],
             label="Multi-word Rhymes",
             wrap=True
         )
 
-    # Row 2: patterns DB with artist/song/context
+    # Row 2: patterns DB compact
     with gr.Row():
         out_patterns = gr.Dataframe(
-            headers=["Target Rhyme", "Syllables", "#-Pattern", "Metrical Name", "Artist", "Song", "Lyrical Context"],
-            datatype=["str", "number", "str", "str", "str", "str", "str"],
+            headers=["Word", "Prosody", "Artist", "Song", "Context"],
+            datatype=["str", "str", "str", "str", "str"],
             label="Rap Pattern Database",
             wrap=True
         )
 
     # Bind both 6-arg and 9-arg signatures (compat with cached UIs)
+    btn = gr.Button("Search", variant="primary")
     btn.click(
         do_search,
         [word, rhyme_type, slant, syl_min, syl_max, rarity_min],
-        [out_uncommon, out_slant, out_multi, out_patterns]
+        [summary_md, out_uncommon, out_slant, out_multi, out_patterns]
     )
     btn.click(
         do_search,
         [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min],
-        [out_uncommon, out_slant, out_multi, out_patterns]
+        [summary_md, out_uncommon, out_slant, out_multi, out_patterns]
     )
 
 if __name__ == "__main__":
