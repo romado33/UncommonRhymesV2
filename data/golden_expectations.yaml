@@ -1,0 +1,92 @@
+hat:
+  must_include_any:
+    - cat
+    - bat
+    - mat
+    - flat
+
+downside:
+  must_include_any:
+    - blindside
+    - inside
+    - landslide
+    - outside  # slant/assonant accepted
+
+double:
+  must_include_any:
+    - trouble
+    - stubble
+    - bubble
+
+rhythm:
+  must_include_any:
+    - algorithm      # slant
+    - prism          # loose slant
+    - schism         # loose slant
+
+orange:
+  must_include_any:
+    - door hinge     # multi-word slant classic
+    - foreign        # slant
+    - sporange       # rare word, acceptable if present
+
+queue:
+  must_include_any:
+    - cue
+    - due
+    - you
+    - few
+
+chandelier:
+  must_include_any:
+    - volunteer
+    - pioneer
+    - musketeer
+
+barbecue:
+  must_include_any:
+    - curlicue
+    - thank you      # multi-word slant
+    - residue        # loose slant
+
+onomatopoeia:
+  must_include_any:
+    - panacea
+    - diarrhea
+    - Cassiopeia     # proper noun; OK if your corpus allows
+
+café latte:
+  must_include_any:
+    - matte          # slant
+    - sachet         # slant
+    - karate         # loose slant by tail
+
+machine learning:
+  must_include_any:
+    - discerning
+    - returning
+    - earning
+
+through time:
+  must_include_any:
+    - true crime
+    - new rhyme
+    - blue line
+
+choir:
+  must_include_any:
+    - fire
+    - liar
+    - wire
+
+rough:
+  must_include_any:
+    - tough
+    - enough
+    - stuff
+
+beat it:
+  must_include_any:
+    - eat it
+    - read it
+    - defeat it
