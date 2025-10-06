@@ -20,6 +20,23 @@ try:
 except Exception:  # pragma: no cover
     from rhyme_core.patterns import find_patterns_by_keys  # type: ignore
 
+# Optional LLM hooks (all no-op if modules/flags are absent)
+try:
+    from config import FLAGS as _FLAGS
+    from llm.rerank import rerank_candidates
+    from llm.phrase_gen import generate_phrases
+    from llm.patterns_semantic import pick_best_contexts
+    from llm.multiword_mining import mine_multiword_variants
+    from llm.nl_query import parse_query
+except Exception:
+    class _D:
+        LLM_RERANK=False; LLM_PHRASE_GEN=False; LLM_PATTERN_RERANK=False; LLM_MULTIWORD_MINE=False; LLM_NL_QUERY=False
+    _FLAGS=_D()
+    def rerank_candidates(*a, **k): return a[2] if len(a)>=3 else []
+    def generate_phrases(*a, **k): return []
+    def pick_best_contexts(*a, **k): return a[1] if len(a)>=2 else []
+    def mine_multiword_variants(*a, **k): return []
+    def parse_query(*a, **k): return {}
 
 # ---------- helpers ----------
 
@@ -41,11 +58,6 @@ def _prosody_row_from_pron(word: str, pron):
 # ---------- main handler ----------
 
 def do_search(*args):
-    """
-    Back-compat handler:
-      - 6 args:  word, rhyme_type, slant, syl_min, syl_max, rarity_min
-      - 9 args:  word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min
-    """
     if len(args) == 6:
         word, rhyme_type, slant, syl_min, syl_max, rarity_min = args
         phrase = ""
@@ -58,6 +70,7 @@ def do_search(*args):
     word = (word or "").strip()
     phrase = (phrase or "").strip()  # *** no default text, will only be used if user actually enters something ***
     rarity_min = float(rarity_min)
+    query_summary = _query_summary(word)
 
     # quick header summary for the query word
     q_pron = _get_pron(_clean(word)) if word else []
@@ -88,6 +101,8 @@ def do_search(*args):
     # First-row buckets
     uncommon, slant_list, multiword = [], [], []
 
+    # Split
+    slant_list, multiword = [], []
     for r in res:
         rt = (r.get("rhyme_type") or "").lower()
         sc = float(r.get("score", 0.0))
@@ -101,14 +116,34 @@ def do_search(*args):
             multiword.append(r)
 
     single_word = [r for r in res if not r.get("is_multiword")]
-    perfect_rare = [
-        r for r in single_word
-        if (r.get("rhyme_type", "").startswith("perfect") and _rarity(r["word"]) >= rarity_min)
-    ]
+    perfect_all = [r for r in single_word if (r.get("rhyme_type", "").startswith("perfect"))]
+    rare_perfects = [r for r in perfect_all if _rarity(r["word"]) >= rarity_min]
+
+    fallback_perfects = []
+    if len(rare_perfects) < TARGET_N:
+        need = TARGET_N - len(rare_perfects)
+        ranked_perfects = sorted(
+            perfect_all,
+            key=lambda x: (
+                -_rarity(x["word"]),
+                _prosody_bonus(qpron, x.get("pron") or []),
+                -float(x.get("score", 0.0)),
+                x["word"],
+            ),
+        )
+        seen_words = {r["word"] for r in rare_perfects}
+        for r in ranked_perfects:
+            if r["word"] in seen_words:
+                continue
+            fallback_perfects.append(r)
+            seen_words.add(r["word"])
+            if len(fallback_perfects) >= need:
+                break
 
     backfill = []
-    if len(perfect_rare) < 20:
-        bf = [
+    if len(rare_perfects) + len(fallback_perfects) < TARGET_N:
+        need = TARGET_N - (len(rare_perfects) + len(fallback_perfects))
+        strong_slants = [
             r for r in single_word
             if (r.get("rhyme_type") in ("assonant",) and _rarity(r["word"]) >= (rarity_min + 0.10))
         ]
@@ -122,7 +157,7 @@ def do_search(*args):
         curation_pool,
         key=lambda x: (-_rarity(x["word"]), -float(x.get("score", 0.0)), x["word"])  # rare then strong
     ):
-        tkey = _tail_key_from_pron(r.get("pron") or [])
+        tkey = tuple(_norm_tail(r.get("pron") or []))
         if tkey in seen_tails:
             continue
         seen_tails.add(tkey)
@@ -134,7 +169,7 @@ def do_search(*args):
     def as_rows(items, add_type=False):
         rows = []
         for r in items:
-            base = _prosody_row_from_pron(r["word"], r.get("pron") or [])
+            prosody = _prosody_compact(r.get("pron") or [])
             if add_type:
                 base.append(r.get("rhyme_type", ""))
             rows.append(base)
