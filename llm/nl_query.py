@@ -1,12 +1,18 @@
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Any, Dict
+
 from config import FLAGS
-from .providers import complete_json
+
+from .loader import get_llm
+
 
 def parse_query(nl: str) -> Dict[str, Any]:
-    if not FLAGS.LLM_NL_QUERY:
+    if not FLAGS.get("USE_LLM"):
         return {}
-    js = complete_json(
+    llm = get_llm()
+    if llm is None:
+        return {}
+    js = llm.complete_json(
         "Parse this user request for rhyme search parameters. Keys: "
         "{'rhyme_type': one of [any,perfect,assonant,consonant,slant], "
         "'syl_min': int, 'syl_max': int, 'rarity_min': float [0..1], 'multiword': bool}.\n"

@@ -1,3 +1,4 @@
-data/patterns.db filter=lfs diff=lfs merge=lfs -text
-data/words_index.sqlite filter=lfs diff=lfs merge=lfs -text
-data/patterns_small.db filter=lfs diff=lfs merge=lfs -text
+* text=auto eol=lf
+
+*.db binary
+*.db.bak binary

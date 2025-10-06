@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.env
 
 # Virtual env
 .venv/
@@ -17,3 +18,5 @@ data/patterns.db
 # (OK if each <100 MB; remove these lines if you plan to deploy to HF Spaces straight from GitHub)
 data/words_index.sqlite
 data/patterns_small.db
+results/
+*.db.bak
