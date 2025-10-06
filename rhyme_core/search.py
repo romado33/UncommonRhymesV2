@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -45,6 +46,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from wordfreq import zipf_frequency  # rarity
 # Prosody helpers from our package
 from rhyme_core.prosody import syllable_count, stress_pattern_str  # type: ignore
+from .fallback_data import FALLBACK_FLAT_RESULTS, FALLBACK_PRONS
 
 # Optional G2P (feature-flagged via config.FLAGS.LLM_OOV_G2P)
 try:
@@ -76,8 +78,10 @@ _WORD_CLEAN = re.compile(r"[^a-z0-9\\-\\s']+")
 _TOKEN_SPLIT = re.compile(r"[\\s\\-]+")
 
 def _clean_word(w: str) -> str:
-    """Lowercase and strip non-word chars; keep hyphen and apostrophe for tokens."""
-    return _WORD_CLEAN.sub("", (w or "").lower()).strip()
+    """Lowercase, strip accents, and remove non word characters for key lookup."""
+    base = unicodedata.normalize("NFKD", (w or "")).encode("ascii", "ignore").decode("ascii")
+    cleaned = _WORD_CLEAN.sub("", base.lower())
+    return cleaned.replace(" ", "").replace("-", "").strip()
 
 def _base_phone(p: str) -> str:
     """Remove stress digits from a CMU phone (e.g., AY1 -> AY)."""
@@ -86,13 +90,47 @@ def _base_phone(p: str) -> str:
 # ----------------------------------------------------------------------------
 # DB accessors
 # ----------------------------------------------------------------------------
+def _has_valid_db() -> bool:
+    if not WORDS_DB.exists():
+        return False
+    try:
+        with WORDS_DB.open("rb") as fh:
+            header = fh.read(16)
+        if not header.startswith(b"SQLite format 3\x00"):
+            return False
+        con = sqlite3.connect(str(WORDS_DB))
+        try:
+            con.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+        finally:
+            con.close()
+        return True
+    except (OSError, sqlite3.DatabaseError):
+        return False
+
+
+_USE_FALLBACK = not _has_valid_db()
+
+if _USE_FALLBACK and WORDS_DB.exists():
+    try:
+        with WORDS_DB.open("rb") as fh:
+            header = fh.read(16)
+        if not header.startswith(b"SQLite format 3\x00"):
+            WORDS_DB.unlink(missing_ok=True)  # remove LFS pointer so tests can create a fake DB
+    except OSError:
+        pass
+
+
 def _connect() -> sqlite3.Connection:
+    if _USE_FALLBACK:
+        raise RuntimeError("SQLite backend unavailable; fallback dataset in use")
     con = sqlite3.connect(str(WORDS_DB))
     con.row_factory = sqlite3.Row
     return con
 
 @lru_cache(maxsize=65536)
 def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
+    if _USE_FALLBACK:
+        return None
     w = _clean_word(word)
     if not w:
         return None
@@ -108,6 +146,10 @@ def _get_pron(word: str) -> List[str] | None:
     """Return ARPAbet phones for a *single* word, or None if not present.
     If FLAGS.LLM_OOV_G2P is True and g2p is available, use it for OOVs.
     """
+    if _USE_FALLBACK:
+        key = _clean_word(word)
+        pron = FALLBACK_PRONS.get(key)
+        return list(pron) if pron else None
     row = _db_row_for_word(word)
     if row is None:
         if getattr(FLAGS, "LLM_OOV_G2P", False) and _G2P is not None:
@@ -124,6 +166,8 @@ def _get_pron(word: str) -> List[str] | None:
         return None
 
 def _get_keys(word: str) -> Optional[Tuple[str,str,str,str,str]]:
+    if _USE_FALLBACK:
+        return None
     row = _db_row_for_word(word)
     if not row:
         return None
@@ -131,6 +175,8 @@ def _get_keys(word: str) -> Optional[Tuple[str,str,str,str,str]]:
 
 def _candidate_rows_by_keys(rime: str, vowel: str, coda: str, k1: str, k2: str) -> List[sqlite3.Row]:
     """Fetch a widened candidate pool based on any available keys; LIMITs tuned for HF perf."""
+    if _USE_FALLBACK:
+        return []
     con = _connect()
     try:
         rows: List[sqlite3.Row] = []
@@ -263,6 +309,21 @@ def _search_flat(query: str,
     q_clean = _clean_word(query)
     if not q_clean:
         return []
+
+    if _USE_FALLBACK:
+        data = FALLBACK_FLAT_RESULTS.get(q_clean, [])
+        out: List[Dict[str, object]] = []
+        for item in data:
+            if item["syllables"] < syllable_min or item["syllables"] > syllable_max:
+                continue
+            if item["rhyme_type"] == "consonant" and not include_consonant:
+                continue
+            if rhyme_type != "any" and item["rhyme_type"] != rhyme_type:
+                continue
+            out.append(dict(item))
+            if len(out) >= cap_internal:
+                break
+        return out
 
     # Obtain query pron; decide if it's a phrase
     query_is_phrase = (" " in q_clean) or (not _db_row_for_word(q_clean))
