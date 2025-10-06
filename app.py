@@ -2,15 +2,15 @@ from pathlib import Path
 import gradio as gr
 from wordfreq import zipf_frequency
 
-# Core logic
+# Core logic (use the bucketed API)
 from rhyme_core.search import (
-    search_word,
+    find_rhymes,
     _get_pron,
-    _clean,
+    phrase_to_pron,
+    stress_pattern_str,
 )
 from rhyme_core.prosody import (
     syllable_count,
-    stress_pattern_str,
     metrical_name,
 )
 
@@ -20,23 +20,6 @@ try:
 except Exception:  # pragma: no cover
     from rhyme_core.patterns import find_patterns_by_keys  # type: ignore
 
-# Optional LLM hooks (all no-op if modules/flags are absent)
-try:
-    from config import FLAGS as _FLAGS
-    from llm.rerank import rerank_candidates
-    from llm.phrase_gen import generate_phrases
-    from llm.patterns_semantic import pick_best_contexts
-    from llm.multiword_mining import mine_multiword_variants
-    from llm.nl_query import parse_query
-except Exception:
-    class _D:
-        LLM_RERANK=False; LLM_PHRASE_GEN=False; LLM_PATTERN_RERANK=False; LLM_MULTIWORD_MINE=False; LLM_NL_QUERY=False
-    _FLAGS=_D()
-    def rerank_candidates(*a, **k): return a[2] if len(a)>=3 else []
-    def generate_phrases(*a, **k): return []
-    def pick_best_contexts(*a, **k): return a[1] if len(a)>=2 else []
-    def mine_multiword_variants(*a, **k): return []
-    def parse_query(*a, **k): return {}
 
 # ---------- helpers ----------
 
@@ -46,18 +29,22 @@ def _rarity(word: str) -> float:
     return (8.0 - z) / 8.0
 
 
-def _prosody_row_from_pron(word: str, pron):
-    """Return compact prosody tuple for a word/pron list."""
+def _prosody_str_from_pron(pron):
     p = pron or []
     syls = syllable_count(p)
     stress = stress_pattern_str(p)  # e.g. 1-0 or 1-1-0
     meter = metrical_name(stress) if stress else "—"
-    return [word, f"{syls} • {stress} • {meter}"]
+    return f"{syls} • {stress or '—'} • {meter}"
 
 
 # ---------- main handler ----------
 
 def do_search(*args):
+    """
+    Back-compat handler:
+      - 6 args:  word, rhyme_type, slant, syl_min, syl_max, rarity_min
+      - 9 args:  word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min
+    """
     if len(args) == 6:
         word, rhyme_type, slant, syl_min, syl_max, rarity_min = args
         phrase = ""
@@ -68,170 +55,64 @@ def do_search(*args):
         raise ValueError(f"Unexpected number of inputs: {len(args)}")
 
     word = (word or "").strip()
-    phrase = (phrase or "").strip()  # *** no default text, will only be used if user actually enters something ***
+    phrase = (phrase or "").strip()  # *** no default text, used only if user enters something ***
     rarity_min = float(rarity_min)
-    query_summary = _query_summary(word)
 
     # quick header summary for the query word
-    q_pron = _get_pron(_clean(word)) if word else []
+    q_pron = _get_pron(word) or phrase_to_pron(word)
     q_syl = syllable_count(q_pron) if q_pron else 0
     q_stress = stress_pattern_str(q_pron) if q_pron else ""
     q_metre = metrical_name(q_stress) if q_stress else "—"
     header_md = f"**{word}** · {q_syl} syllables · stress **{q_stress or '—'}** · metre **{q_metre}**"
 
-    # Pull a full pool and ALWAYS include pronunciations so we can compute prosody.
-    res = search_word(
-        word,
-        rhyme_type="any",
-        slant_strength=float(slant),
-        syllable_min=int(syl_min),
-        syllable_max=int(syl_max),
-        max_results=1000,
-        include_pron=True,
-    ) if word else []
+    # Use bucketed API directly
+    buckets = find_rhymes(word, max_results=100, include_consonant=False) if word else {"uncommon": [], "slant": [], "multiword": []}
 
-    # --- split & curate ---
-    def _tail_key_from_pron(pron):
-        from rhyme_core.search import _norm_tail  # lazy import to avoid cycles
-        try:
-            return tuple(_norm_tail(pron or []))
-        except Exception:
-            return ()
-
-    # First-row buckets
-    uncommon, slant_list, multiword = [], [], []
-
-    # Split
-    slant_list, multiword = [], []
-    for r in res:
-        rt = (r.get("rhyme_type") or "").lower()
-        sc = float(r.get("score", 0.0))
-        is_multi = bool(r.get("is_multiword"))
-        if rt == "consonant":
-            # hide consonant class per latest guidance
+    # Curate uncommon by rarity threshold (already curated internally; apply final rarity gate)
+    uncommon_all = buckets.get("uncommon", [])
+    uncommon = []
+    for u in uncommon_all:
+        disp = (u.get("name") or u.get("phrase") or "").strip()
+        if not disp:
             continue
-        if rt != "perfect" or sc < 0.999:
-            slant_list.append(r)
-        if is_multi:
-            multiword.append(r)
-
-    single_word = [r for r in res if not r.get("is_multiword")]
-    perfect_all = [r for r in single_word if (r.get("rhyme_type", "").startswith("perfect"))]
-    rare_perfects = [r for r in perfect_all if _rarity(r["word"]) >= rarity_min]
-
-    fallback_perfects = []
-    if len(rare_perfects) < TARGET_N:
-        need = TARGET_N - len(rare_perfects)
-        ranked_perfects = sorted(
-            perfect_all,
-            key=lambda x: (
-                -_rarity(x["word"]),
-                _prosody_bonus(qpron, x.get("pron") or []),
-                -float(x.get("score", 0.0)),
-                x["word"],
-            ),
-        )
-        seen_words = {r["word"] for r in rare_perfects}
-        for r in ranked_perfects:
-            if r["word"] in seen_words:
-                continue
-            fallback_perfects.append(r)
-            seen_words.add(r["word"])
-            if len(fallback_perfects) >= need:
-                break
-
-    backfill = []
-    if len(rare_perfects) + len(fallback_perfects) < TARGET_N:
-        need = TARGET_N - (len(rare_perfects) + len(fallback_perfects))
-        strong_slants = [
-            r for r in single_word
-            if (r.get("rhyme_type") in ("assonant",) and _rarity(r["word"]) >= (rarity_min + 0.10))
-        ]
-        bf = [r for r in bf if float(r.get("score", 0.0)) >= 0.55]
-        backfill = bf
-
-    curation_pool = perfect_rare + backfill
-
-    seen_tails = set()
-    for r in sorted(
-        curation_pool,
-        key=lambda x: (-_rarity(x["word"]), -float(x.get("score", 0.0)), x["word"])  # rare then strong
-    ):
-        tkey = tuple(_norm_tail(r.get("pron") or []))
-        if tkey in seen_tails:
-            continue
-        seen_tails.add(tkey)
-        uncommon.append(r)
+        if _rarity(disp) >= rarity_min:
+            pr = _get_pron(disp) or phrase_to_pron(disp)
+            uncommon.append([disp, _prosody_str_from_pron(pr)])
         if len(uncommon) >= 20:
             break
 
-    # format rows
-    def as_rows(items, add_type=False):
-        rows = []
-        for r in items:
-            prosody = _prosody_compact(r.get("pron") or [])
-            if add_type:
-                base.append(r.get("rhyme_type", ""))
-            rows.append(base)
-        return rows
+    # Slant and Multi-word — map to display rows with prosody
+    slant_rows = []
+    for s in buckets.get("slant", [])[:50]:
+        n = (s.get("name") or s.get("phrase") or "").strip()
+        if not n:
+            continue
+        pr = _get_pron(n) or phrase_to_pron(n)
+        slant_rows.append([n, _prosody_str_from_pron(pr), s.get("type","")])
 
-    row1_col1 = as_rows(uncommon)
-    row1_col2 = as_rows(sorted(slant_list, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50], add_type=True)
-    row1_col3 = as_rows(sorted(multiword, key=lambda x: (-x.get("score", 0.0), x["word"]))[:50])
+    multi_rows = []
+    for m in buckets.get("multiword", [])[:50]:
+        n = (m.get("name") or m.get("phrase") or "").strip()
+        if not n:
+            continue
+        pr = _get_pron(n) or phrase_to_pron(n)
+        multi_rows.append([n, _prosody_str_from_pron(pr)])
 
-    # Row 2: patterns DB — now uses PHRASE **only if user entered it**; otherwise uses WORD
+    # Row 2: patterns DB — uses PHRASE if user provided, otherwise WORD
     key_for_patterns = phrase if phrase else word
     patterns_rows = []
     if key_for_patterns:
         try:
             enriched = find_patterns_by_keys(key_for_patterns, limit=int(patterns_limit)) or []
-            # Keep rows where either target OR source truly rhymes with the query *word* pronunciation.
-            qpr = q_pron
-            if qpr:
-                from rhyme_core.search import classify_rhyme, _final_coda
-                def _best_choice(target_word: str, source_word: str):
-                    def qual(rt: str) -> int:
-                        return {"perfect": 3, "assonant": 2, "consonant": 0, "slant": 1}.get(rt, 0)
-                    choices = []
-                    for w in [target_word or "", source_word or ""]:
-                        w = (w or "").strip().lower()
-                        if not w:
-                            continue
-                        pr = _get_pron(_clean(w)) or []
-                        if not pr:
-                            continue
-                        rt = classify_rhyme(qpr, pr)
-                        if rt == "none" or rt == "consonant":
-                            continue
-                        if rt in ("assonant",):
-                            if tuple(_final_coda(qpr)) != tuple(_final_coda(pr)):
-                                continue
-                        choices.append((qual(rt), w, pr, rt))
-                    if not choices:
-                        return None
-                    choices.sort(reverse=True)
-                    return choices[0]
-
-                for d in enriched:
-                    tgt = (d.get("target_rhyme") or d.get("target_word") or "").strip().lower()
-                    src = (d.get("source_word") or "").strip().lower()
-                    pick = _best_choice(tgt, src)
-                    if not pick:
-                        continue
-                    _, chosen_word, chosen_pr, _rtype = pick
-                    base = _prosody_row_from_pron(chosen_word, chosen_pr)
-                    artist = d.get("artist", "")
-                    song = d.get("song_title", "")
-                    ctx_src = (d.get("lyric_context") or d.get("source_context") or "").strip()
-                    ctx_tgt = (d.get("target_context") or "").strip()
-                    context = ctx_src
-                    if ctx_tgt:
-                        context = f"{ctx_src} ⟂ {ctx_tgt}" if ctx_src else ctx_tgt
-                    patterns_rows.append(base + [artist, song, context[:400]])
+            for d in enriched:
+                # pick best display word (target > source)
+                w = (d.get("target") or d.get("source") or "").strip()
+                pr = _get_pron(w) or phrase_to_pron(w)
+                patterns_rows.append([w, _prosody_str_from_pron(pr), d.get("artist",""), d.get("song",""), (d.get("context","") or "")[:400]])
         except Exception:
             patterns_rows = []
 
-    return header_md, row1_col1, row1_col2, row1_col3, patterns_rows
+    return header_md, uncommon, slant_rows, multi_rows, patterns_rows
 
 
 # ---------- UI ----------
