@@ -1,202 +1,447 @@
+# -*- coding: utf-8 -*-
 """
-Search helpers and CMU‑index lookup. Public API:
-- search_word(...)
-- _get_pron, _clean
-- classify_rhyme, _final_coda, _norm_tail
-- stress_pattern_str, syllable_count
+UncommonRhymesV2 — Deterministic search core
+============================================
 
-Relies on SQLite at data/words_index.sqlite with schema:
+This module provides deterministic rhyme search over a CMU-derived
+SQLite index, with:
+
+- Single **and** multi-word (phrase) query support
+- Stress-aware rhyme nucleus (last **primary-stressed** vowel)
+- Candidate widening (rime_key / vowel_key / coda_key / k1 / k2)
+- Clean, bucketed output: Uncommon (perfect, backfilled), Slant,
+  and Multi-word
+- Optional LLM OOV G2P fallback (feature-flagged)
+- Prosody helpers (syllables, stress string) wired to rhyme scoring
+
+Public API
+----------
+- search_word(...): flat scored list of candidates
+- find_rhymes(...): bucketed dict for the UI (uncommon/slant/multiword)
+- stress_pattern_str, syllable_count: re-exported from prosody
+
+Assumptions
+-----------
+- SQLite DB at data/words_index.sqlite with schema:
   words(word TEXT PRIMARY KEY, pron TEXT JSON, syls INT,
         k1 TEXT, k2 TEXT, rime_key TEXT, vowel_key TEXT, coda_key TEXT)
+
+Determinism
+-----------
+All operations are deterministic given the DB contents and flags.
+No randomization; LLM hooks are OFF by default.
 """
 from __future__ import annotations
+
 import json
+import os
 import re
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+# External deps
+from wordfreq import zipf_frequency  # rarity
+# Prosody helpers from our package
+from rhyme_core.prosody import syllable_count, stress_pattern_str  # type: ignore
+
+# Optional G2P (feature-flagged via config.FLAGS.LLM_OOV_G2P)
+try:
+    from g2p_en import G2p  # type: ignore
+    _G2P = G2p()
+except Exception:  # pragma: no cover - environment without g2p_en
+    _G2P = None  # type: ignore
+
+# Optional flags
+try:
+    from config import FLAGS  # type: ignore
+except Exception:
+    class _F:  # minimal fallback so import never breaks in tests
+        LLM_OOV_G2P = False
+    FLAGS = _F()  # type: ignore
+
+# ----------------------------------------------------------------------------
+# Paths / DB
+# ----------------------------------------------------------------------------
 DATA_DIR = Path("data")
 WORDS_DB = DATA_DIR / "words_index.sqlite"
 
+# ----------------------------------------------------------------------------
+# Regex & phoneme helpers
+# ----------------------------------------------------------------------------
 _VOWELS = {"AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"}
-_STRIP_STRESS = re.compile(r"\d")
-_WORD_CLEAN = re.compile(r"[^a-z0-9\-\s']+")
+_STRIP_STRESS = re.compile(r"(\d)")
+_WORD_CLEAN = re.compile(r"[^a-z0-9\\-\\s']+")
+_TOKEN_SPLIT = re.compile(r"[\\s\\-]+")
 
-# Optional LLM OOV fallback
-try:
-    from llm.oov_g2p import infer_pron_arpabet  # type: ignore
-    from config import FLAGS as _FLAGS  # type: ignore
-except Exception:
-    infer_pron_arpabet = None
-    class _Dummy:
-        LLM_OOV_G2P = False
-    _FLAGS = _Dummy()
-
-# ---------------- Pron helpers ----------------
-
-def _clean(w: str) -> str:
+def _clean_word(w: str) -> str:
+    """Lowercase and strip non-word chars; keep hyphen and apostrophe for tokens."""
     return _WORD_CLEAN.sub("", (w or "").lower()).strip()
+
+def _base_phone(p: str) -> str:
+    """Remove stress digits from a CMU phone (e.g., AY1 -> AY)."""
+    return _STRIP_STRESS.sub("", p)
+
+# ----------------------------------------------------------------------------
+# DB accessors
+# ----------------------------------------------------------------------------
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(str(WORDS_DB))
+    con.row_factory = sqlite3.Row
+    return con
+
+@lru_cache(maxsize=65536)
+def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
+    w = _clean_word(word)
+    if not w:
+        return None
+    con = _connect()
+    try:
+        row = con.execute("SELECT word,pron,syls,k1,k2,rime_key,vowel_key,coda_key FROM words WHERE word=?", (w,)).fetchone()
+        return row
+    finally:
+        con.close()
 
 @lru_cache(maxsize=65536)
 def _get_pron(word: str) -> List[str] | None:
-    w = _clean(word)
-    if not w:
-        return None
-    con = sqlite3.connect(str(WORDS_DB))
-    con.row_factory = sqlite3.Row
-    row = con.execute("SELECT pron FROM words WHERE word=?", (w,)).fetchone()
-    con.close()
-    if not row:
-        # OOV LLM fallback (flagged)
-        if getattr(_FLAGS, "LLM_OOV_G2P", False) and infer_pron_arpabet:
+    """Return ARPAbet phones for a *single* word, or None if not present.
+    If FLAGS.LLM_OOV_G2P is True and g2p is available, use it for OOVs.
+    """
+    row = _db_row_for_word(word)
+    if row is None:
+        if getattr(FLAGS, "LLM_OOV_G2P", False) and _G2P is not None:
             try:
-                arp = infer_pron_arpabet(w)
-                if arp:
-                    return arp
+                phones = _G2P(_clean_word(word)) or []
+                # g2p_en returns mixed tokens; keep CMU-like uppercase phones only
+                return [p for p in phones if p and p[0].isalpha() and p[0].isupper()]
             except Exception:
-                pass
+                return None
         return None
     try:
         return json.loads(row["pron"]) or []
     except Exception:
         return None
 
-# stress / syllable helpers
+def _get_keys(word: str) -> Optional[Tuple[str,str,str,str,str]]:
+    row = _db_row_for_word(word)
+    if not row:
+        return None
+    return (row["rime_key"], row["vowel_key"], row["coda_key"], row["k1"], row["k2"])
 
-def stress_pattern_str(pron: List[str]) -> str:
-    if not pron:
-        return ""
-    out = []
-    for p in pron:
-        m = re.search(r"(\d)$", p)
-        if m:
-            out.append(m.group(1))
-    return "-".join(out) if out else ""
+def _candidate_rows_by_keys(rime: str, vowel: str, coda: str, k1: str, k2: str) -> List[sqlite3.Row]:
+    """Fetch a widened candidate pool based on any available keys; LIMITs tuned for HF perf."""
+    con = _connect()
+    try:
+        rows: List[sqlite3.Row] = []
+        if rime:
+            rows += con.execute("SELECT word,pron,syls FROM words WHERE rime_key=? LIMIT 2000", (rime,)).fetchall()
+        if vowel:
+            rows += con.execute("SELECT word,pron,syls FROM words WHERE vowel_key=? LIMIT 2000", (vowel,)).fetchall()
+        if coda:
+            rows += con.execute("SELECT word,pron,syls FROM words WHERE coda_key=? LIMIT 1200", (coda,)).fetchall()
+        if k1:
+            rows += con.execute("SELECT word,pron,syls FROM words WHERE k1=? LIMIT 1200", (k1,)).fetchall()
+        if k2:
+            rows += con.execute("SELECT word,pron,syls FROM words WHERE k2=? LIMIT 1200", (k2,)).fetchall()
+        return rows
+    finally:
+        con.close()
 
+# ----------------------------------------------------------------------------
+# Prosody + rhyme nucleus helpers
+# ----------------------------------------------------------------------------
+def _last_primary_vowel_index(pron: Sequence[str]) -> int:
+    last_vowel = -1
+    last_primary = -1
+    for i, ph in enumerate(pron):
+        b = _base_phone(ph)
+        if b in _VOWELS:
+            last_vowel = i
+            if ph.endswith("1"):
+                last_primary = i
+    return last_primary if last_primary >= 0 else last_vowel
 
-def syllable_count(pron: List[str]) -> int:
-    if not pron:
-        return 0
-    return sum(1 for p in pron if p and p[-1].isdigit())
+def _vowel_and_coda_from_index(pron: Sequence[str], idx: int) -> Tuple[str, Tuple[str,...]]:
+    if idx < 0:
+        return "", tuple()
+    v = _base_phone(pron[idx])
+    coda = tuple(_base_phone(p) for p in pron[idx+1:])
+    return v, coda
 
-# tail parsing
+def stressed_vowel_and_coda(pron: Sequence[str]) -> Tuple[str, Tuple[str,...]]:
+    return _vowel_and_coda_from_index(pron, _last_primary_vowel_index(pron))
 
-def _vowel_core(p: str) -> str:
-    return _STRIP_STRESS.sub("", p)
+def final_vowel_and_coda(pron: Sequence[str]) -> Tuple[str, Tuple[str,...]]:
+    j = -1
+    for i in range(len(pron)-1, -1, -1):
+        if _base_phone(pron[i]) in _VOWELS:
+            j = i; break
+    return _vowel_and_coda_from_index(pron, j)
 
-
-def _final_vowel_and_coda(pron: List[str]) -> Tuple[str, Tuple[str, ...]]:
-    v = ""
-    i = len(pron) - 1
-    while i >= 0:
-        ph = pron[i]
-        base = _vowel_core(ph)
-        if base in _VOWELS:
-            v = base
-            break
-        i -= 1
-    coda = [_vowel_core(p) for p in pron[i+1:]] if i >= 0 else []
-    return v, tuple(coda)
-
-
-def _final_coda(pron: List[str]) -> Tuple[str, ...]:
-    return _final_vowel_and_coda(pron)[1]
-
-
-def _norm_tail(pron: List[str]) -> Tuple[str, ...]:
-    v, c = _final_vowel_and_coda(pron)
-    return (v,) + c if v else c
-
-# ---------------- Rhyme classifier ----------------
-
-def classify_rhyme(qpron: List[str], cpron: List[str]) -> str:
+# ----------------------------------------------------------------------------
+# Classification
+# ----------------------------------------------------------------------------
+def classify_rhyme(qpron: Sequence[str], cpron: Sequence[str]) -> str:
+    """Return one of: perfect, assonant, consonant, slant, none."""
     if not qpron or not cpron:
         return "none"
-    qv, qc = _final_vowel_and_coda(qpron)
-    cv, cc = _final_vowel_and_coda(cpron)
-    if qv == cv and qc == cc:
+    qv, qc = stressed_vowel_and_coda(qpron)
+    cv, cc = stressed_vowel_and_coda(cpron)
+    if qv and qv == cv and qc == cc:
         return "perfect"
-    if qv == cv and qc != cc:
+    if qv and qv == cv and qc != cc:
         return "assonant"
-    if qv != cv and qc == cc and qc:
+    if qc and qc == cc and qv != cv:
         return "consonant"
-    return "slant" if (qpron and cpron and _vowel_core(qpron[-1]) == _vowel_core(cpron[-1])) else "none"
+    # fallback slant on *final* vowel nucleus
+    qvf, _ = final_vowel_and_coda(qpron)
+    cvf, _ = final_vowel_and_coda(cpron)
+    if qvf and qvf == cvf:
+        return "slant"
+    return "none"
 
-# ---------------- Candidate pool ----------------
-
-def _db_candidates_for_word(word: str) -> Iterable[sqlite3.Row]:
-    w = _clean(word)
-    con = sqlite3.connect(str(WORDS_DB))
-    con.row_factory = sqlite3.Row
-    row = con.execute("SELECT rime_key,vowel_key,coda_key,k1,k2 FROM words WHERE word=?", (w,)).fetchone()
-    if not row:
-        con.close()
+# ----------------------------------------------------------------------------
+# Phrase support
+# ----------------------------------------------------------------------------
+def phrase_to_pron(phrase: str) -> List[str]:
+    """Build a phrase pronunciation by concatenating token prons (using DB where possible).
+    If a token is OOV and LLM_OOV_G2P is enabled with g2p available, we fall back to it;
+    otherwise we *skip* that token (keeps determinism).
+    """
+    s = (phrase or "").strip()
+    if not s:
         return []
-    rime, vow, coda, k1, k2 = row["rime_key"], row["vowel_key"], row["coda_key"], row["k1"], row["k2"]
-    rows: list = []
-    if rime:
-        rows += con.execute("SELECT word,pron,syls FROM words WHERE rime_key=? LIMIT 600", (rime,)).fetchall()
-    if vow:
-        rows += con.execute("SELECT word,pron,syls FROM words WHERE vowel_key=? LIMIT 400", (vow,)).fetchall()
-    if coda:
-        rows += con.execute("SELECT word,pron,syls FROM words WHERE coda_key=? LIMIT 400", (coda,)).fetchall()
-    if k1:
-        rows += con.execute("SELECT word,pron,syls FROM words WHERE k1=? LIMIT 600", (k1,)).fetchall()
-    if k2:
-        rows += con.execute("SELECT word,pron,syls FROM words WHERE k2=? LIMIT 600", (k2,)).fetchall()
-    con.close()
-    return rows
+    tokens = [t for t in _TOKEN_SPLIT.split(_clean_word(s)) if t]
+    out: List[str] = []
+    for t in tokens:
+        p = _get_pron(t)
+        if not p and getattr(FLAGS, "LLM_OOV_G2P", False) and _G2P is not None:
+            try:
+                guess = _G2P(t) or []
+                p = [ph for ph in guess if ph and ph[0].isalpha() and ph[0].isupper()]
+            except Exception:
+                p = []
+        if p:
+            out.extend(p)
+    return out
 
-# ---------------- Core search ----------------
+# ----------------------------------------------------------------------------
+# Rarity & scoring
+# ----------------------------------------------------------------------------
+def _rarity_score(word: str) -> float:
+    """Normalize wordfreq ZIPF to 0..1 where 1 is rarest. Clamped."""
+    try:
+        z = zipf_frequency(word.lower(), "en")
+    except Exception:
+        z = 1.0
+    # Typical english words are 3-7 range; invert + normalize
+    val = (7.5 - float(z)) / 7.5
+    if val < 0: val = 0.0
+    if val > 1: val = 1.0
+    return val
 
-def search_word(
-    word: str,
-    rhyme_type: str = "any",
-    slant_strength: float = 0.5,
-    syllable_min: int = 1,
-    syllable_max: int = 8,
-    max_results: int = 500,
-    include_pron: bool = False,
-) -> List[dict]:
-    w = _clean(word)
-    qpron = _get_pron(w) or []
-    if not qpron:
+def _score_item(rtype: str, stress_eq: bool, rarity: float) -> float:
+    # base by type
+    base = {"perfect": 1.0, "assonant": 0.86, "slant": 0.75, "consonant": 0.70, "none": 0.0}.get(rtype, 0.0)
+    # add tiny bonus for exact stress alignment
+    if stress_eq:
+        base += 0.02
+    # blend rarity mild (keeps determinism; prevents overdominance by ultrarare junk)
+    return base * (0.85 + 0.15 * rarity)
+
+# ----------------------------------------------------------------------------
+# Flat search (internal)
+# ----------------------------------------------------------------------------
+def _search_flat(query: str,
+                 rhyme_type: str = "any",
+                 include_consonant: bool = False,
+                 syllable_min: int = 1,
+                 syllable_max: int = 8,
+                 cap_internal: int = 2000) -> List[Dict[str, object]]:
+    """Return a flat list of scored candidates for the given query."""
+    q_clean = _clean_word(query)
+    if not q_clean:
         return []
 
-    pool = _db_candidates_for_word(w)
+    # Obtain query pron; decide if it's a phrase
+    query_is_phrase = (" " in q_clean) or (not _db_row_for_word(q_clean))
+    if query_is_phrase:
+        qpron = phrase_to_pron(q_clean)
+        if not qpron:
+            return []
+        # pivot on last token present in DB for breadth
+        tokens = [t for t in _TOKEN_SPLIT.split(q_clean) if t]
+        pivot = None
+        for t in reversed(tokens):
+            if _db_row_for_word(t):
+                pivot = t
+                break
+        pool_rows: List[sqlite3.Row] = _candidate_rows_by_keys(*(_get_keys(pivot) or ("","","","",""))) if pivot else []
+    else:
+        qpron = _get_pron(q_clean) or []
+        pool_rows = _candidate_rows_by_keys(*(_get_keys(q_clean) or ("","","","","")))
 
-    out: List[dict] = []
+    out: List[Dict[str, object]] = []
     seen: set[str] = set()
-    for r in pool:
-        cand = r["word"]
-        if cand == w or cand in seen:
+    sp_q = stress_pattern_str(qpron)
+
+    for r in pool_rows:
+        word = r["word"]
+        if not word or word == q_clean or word in seen:
             continue
+        seen.add(word)
         try:
-            pron = json.loads(r["pron"]) or []
+            pron = json.loads(r["pron"]) if isinstance(r["pron"], (bytes, bytearray)) else (json.loads(r["pron"]) if isinstance(r["pron"], str) and r["pron"].startswith("[") else r["pron"])
         except Exception:
-            continue
-        syls = syllable_count(pron)
+            # DB may already store list in python object (sqlite adapter), fallback:
+            pron = r["pron"]
+        if not isinstance(pron, list):
+            # if pron is a space-separated string from older builds
+            if isinstance(pron, str):
+                pron = [p for p in pron.split() if p]
+            else:
+                continue
+
+        syls = int(r["syls"]) if r["syls"] is not None else syllable_count(pron)
         if syls < syllable_min or syls > syllable_max:
             continue
+
         rtype = classify_rhyme(qpron, pron)
+        if rtype == "none":
+            continue
+        if rtype == "consonant" and not include_consonant:
+            continue
         if rhyme_type != "any" and rtype != rhyme_type:
             continue
-        base = {"perfect": 1.0, "consonant": 0.9, "assonant": 0.86, "slant": 0.75, "none": 0.0}[rtype]
-        if rtype == "slant":
-            base *= (0.5 + 0.5 * max(0.0, min(1.0, slant_strength)))
-        # prosody tie-break baked into score a touch
-        stress_equal = 1 if (stress_pattern_str(qpron) and stress_pattern_str(qpron) == stress_pattern_str(pron)) else 0
-        score = base + 0.02 * stress_equal
-        out.append({
-            "word": cand,
-            "score": score,
-            "rhyme_type": rtype,
-            "is_multiword": (" " in cand or "-" in cand),
-            **({"pron": pron} if include_pron else {}),
-        })
-        seen.add(cand)
 
-    out.sort(key=lambda x: (-x["score"], x["word"]))
-    return out[:max_results]
+        stress_eq = (sp_q and (sp_q == stress_pattern_str(pron)))
+        score = _score_item(rtype, bool(stress_eq), _rarity_score(word))
+
+        out.append({
+            "word": word,
+            "rhyme_type": rtype,
+            "score": float(score),
+            "is_multiword": (" " in word or "-" in word),
+            "syllables": int(syls),
+        })
+        if len(out) >= cap_internal * 2:  # safety against pathological pools
+            break
+
+    out.sort(key=lambda x: (-x["score"], x["syllables"], x["word"]))  # deterministic
+    return out[:cap_internal]
+
+# ----------------------------------------------------------------------------
+# Public: search_word (flat) and find_rhymes (bucketed)
+# ----------------------------------------------------------------------------
+def search_word(word: str,
+                rhyme_type: str = "any",
+                slant_strength: float = 0.5,  # kept for API compatibility; slant weighting is internal
+                syllable_min: int = 1,
+                syllable_max: int = 8,
+                max_results: int = 500,
+                include_pron: bool = False,
+                include_consonant: bool = False) -> List[Dict[str, object]]:
+    """Flat search API used by some tests/tools."""
+    flat = _search_flat(word,
+                        rhyme_type=rhyme_type,
+                        include_consonant=include_consonant,
+                        syllable_min=syllable_min,
+                        syllable_max=syllable_max,
+                        cap_internal=max_results)
+    if include_pron:
+        # attach pron if caller asked (extra SQLite hits avoided intentionally for speed)
+        for it in flat:
+            w = str(it["word"])
+            it["pron"] = _get_pron(w) or []
+    return flat
+
+def _to_bucket_item(item: Dict[str, object]) -> Dict[str, object]:
+    out = {"type": item["rhyme_type"], "score": float(item["score"])}
+    w = str(item["word"])
+    if " " in w or "-" in w:
+        out["phrase"] = w
+    else:
+        out["name"] = w
+    return out
+
+def find_rhymes(query: str,
+                max_results: int = 20,
+                include_consonant: bool = False,
+                syllable_min: int = 1,
+                syllable_max: int = 8,
+                slant_strength: float = 0.5,
+                include_pron: bool = False,
+                **kwargs) -> Dict[str, List[Dict[str, object]]]:
+    """Bucketed API for the UI.
+
+    Returns: {
+      "uncommon": [ {name, type=perfect|assonant|..., score}, ... ],
+      "slant":    [ {name, type=assonant|slant|consonant, score}, ... ],
+      "multiword":[ {phrase, type=..., score}, ... ]
+    }
+    """
+    # widen internal cap then cap per bucket
+    flat = _search_flat(query,
+                        rhyme_type="any",
+                        include_consonant=include_consonant,
+                        syllable_min=syllable_min,
+                        syllable_max=syllable_max,
+                        cap_internal=max(1200, max_results * 12))
+
+    uncommon: List[Dict[str, object]] = []
+    slant: List[Dict[str, object]] = []
+    multi: List[Dict[str, object]] = []
+
+    for it in flat:
+        typ = str(it["rhyme_type"])
+        is_multi = bool(it["is_multiword"])
+        b = _to_bucket_item(it)
+
+        if typ == "perfect":
+            uncommon.append(b)
+        elif typ in ("assonant", "slant"):
+            slant.append(b)
+        elif typ == "consonant":
+            if include_consonant:
+                slant.append(b)
+
+        if is_multi:
+            multi.append(b)
+
+    # Stable sorts
+    def _ku(x): return (-float(x.get("score", 0.0)), x.get("name",""))
+    def _ks(x):
+        order = {"assonant":0, "slant":1, "consonant":2}
+        return (order.get(x.get("type","slant"), 9), -float(x.get("score",0.0)), x.get("name","") or x.get("phrase",""))
+    def _km(x): return (-float(x.get("score", 0.0)), x.get("phrase",""))
+
+    uncommon.sort(key=_ku)
+    slant.sort(key=_ks)
+    multi.sort(key=_km)
+
+    # Backfill uncommon with rare assonants (clearly labeled in UI) if under cap
+    if len(uncommon) < max_results:
+        needed = max_results - len(uncommon)
+        extras = [x for x in slant if x.get("type") == "assonant"]
+        uncommon.extend(extras[:needed])
+
+    return {
+        "uncommon": uncommon[:max_results],
+        "slant": slant[:max_results],
+        "multiword": multi[:max_results],
+    }
+
+# Legacy alias for older imports
+search = find_rhymes
+
+__all__ = [
+    "search_word",
+    "find_rhymes",
+    "classify_rhyme",
+    "stressed_vowel_and_coda",
+    "final_vowel_and_coda",
+    "phrase_to_pron",
+    "syllable_count",
+    "stress_pattern_str",
+]
