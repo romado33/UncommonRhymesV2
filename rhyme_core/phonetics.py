@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import lru_cache
-from typing import List, Tuple
+from typing import Iterable, List, Sequence, Tuple
+import json
 import re
 
 VOWEL_RE = re.compile(r"[AEIOU]")        # ARPABET vowel marker in stress symbols
@@ -41,3 +42,55 @@ def key_k2(phones: List[str]) -> Tuple[str,...]:
         return key_k1(phones)
     penult = syll_ix[-2]
     return tuple(phones[penult:])
+
+
+def parse_pron_field(pron: str | Sequence[str] | Iterable[str] | None) -> List[str]:
+    """Normalize a pronunciation field into a list of ARPABET tokens."""
+
+    if pron is None:
+        return []
+
+    if isinstance(pron, (list, tuple)):
+        return [str(p) for p in pron if p]
+
+    if not isinstance(pron, str):
+        return [str(pron)]
+
+    p = pron.strip()
+    if not p:
+        return []
+
+    if p.startswith("[") and p.endswith("]"):
+        try:
+            arr = json.loads(p)
+        except Exception:
+            arr = None
+        if isinstance(arr, (list, tuple)):
+            return [str(tok) for tok in arr if tok]
+
+    return [tok for tok in p.replace(",", " ").split() if tok]
+
+
+def tail_keys(phones: Sequence[str]) -> Tuple[str, str, str]:
+    """Return (vowel_key, coda_key, rime_key) from the final vowel onward."""
+
+    toks = [tok for tok in phones if tok]
+    if not toks:
+        return "", "", ""
+
+    v_idx = -1
+    for i in range(len(toks) - 1, -1, -1):
+        base = toks[i].rstrip("0123456789")
+        if base in SYLLABLE_VOWELS:
+            v_idx = i
+            break
+
+    if v_idx == -1:
+        coda = "".join(toks)
+        return "", coda, coda
+
+    vowel = toks[v_idx]
+    after = toks[v_idx + 1 :]
+    coda = "".join(after) if after else ""
+    rime = f"{vowel}-{coda}" if coda else vowel
+    return vowel, coda, rime

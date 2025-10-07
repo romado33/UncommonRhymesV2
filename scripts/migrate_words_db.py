@@ -3,53 +3,9 @@ import os
 import sqlite3
 from contextlib import closing
 
+from rhyme_core.phonetics import parse_pron_field, tail_keys
+
 DB_PATH = os.environ.get("WORDS_DB_PATH", "data/words_index.sqlite")
-
-VOWELS = {
-    "AA","AE","AH","AO","AW","AY",
-    "EH","ER","EY",
-    "IH","IY",
-    "OW","OY",
-    "UH","UW",
-}
-
-def _tokens(pron: str):
-    # Normalize whitespace, split into ARPABET tokens (e.g., 'T AY1 M')
-    return [t for t in pron.strip().split() if t]
-
-def _is_vowel(tok: str) -> bool:
-    # Accept both 'AY1' and 'AY' as vowel tokens; compare by stripping digits
-    base = tok.rstrip("0123456789")
-    return base in VOWELS
-
-def _vowel_key(tok: str) -> str:
-    # Preserve stress number if present; e.g., 'AY1'
-    return tok
-
-def _extract_tail_keys(pron: str):
-    """
-    Given an ARPABET pron string, return (vowel_key, coda_key, rime_key).
-    - vowel_key: last vowel token (incl. stress), e.g., 'AY1'
-    - coda_key: concatenated consonant tokens after that vowel, e.g., 'M' or 'ND'
-    - rime_key: f'{vowel_key}-{coda_key}' (or just vowel_key if no coda)
-    """
-    toks = _tokens(pron)
-    if not toks:
-        return ("", "", "")
-    # Find last vowel index
-    v_idx = -1
-    for i in range(len(toks) - 1, -1, -1):
-        if _is_vowel(toks[i]):
-            v_idx = i
-            break
-    if v_idx == -1:
-        # No vowel found; treat entire tail as coda
-        return ("", "".join(toks), "".join(toks))
-    vowel = _vowel_key(toks[v_idx])
-    after = toks[v_idx + 1 :]
-    coda = "".join(after) if after else ""
-    rime = f"{vowel}-{coda}" if coda else vowel
-    return (vowel, coda, rime)
 
 def ensure_columns(con: sqlite3.Connection) -> list[str]:
     have = {row[1] for row in con.execute("PRAGMA table_info(words)").fetchall()}
@@ -76,7 +32,8 @@ def backfill(con: sqlite3.Connection, batch_size: int = 1000) -> int:
         chunk = rows[i:i+batch_size]
         updates = []
         for rowid, pron in chunk:
-            vowel, coda, rime = _extract_tail_keys(pron or "")
+            phones = parse_pron_field(pron)
+            vowel, coda, rime = tail_keys(phones)
             updates.append((rime, vowel, coda, rowid))
         cur.executemany(
             "UPDATE words SET rime_key=?, vowel_key=?, coda_key=? WHERE rowid=?",
@@ -94,6 +51,9 @@ def main():
         missing = ensure_columns(con)
         updated = backfill(con)
         con.execute("CREATE INDEX IF NOT EXISTS idx_words_word ON words(word)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_rime_key ON words(rime_key)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_vowel_key ON words(vowel_key)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_coda_key ON words(coda_key)")
         con.commit()
     print(f"Migration complete. Added columns: {missing or 'none'}. Rows updated: {updated}.")
 

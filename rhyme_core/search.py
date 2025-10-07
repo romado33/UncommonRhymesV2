@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import sqlite3
 from pathlib import Path
 from functools import lru_cache
@@ -11,6 +10,7 @@ from .fallback_data import (
     get_fallback_pron as _get_fallback_pron,
     fallback_key as _fallback_key,
 )
+from .phonetics import parse_pron_field as _parse_pron_field, tail_keys as _tail_keys
 
 # ----------------------------------------------------------------------------
 # Paths / DB
@@ -86,10 +86,6 @@ if not getattr(sqlite3, "_ur_insert_patch", False):
     sqlite3._ur_insert_patch = True  # type: ignore[attr-defined]
     sqlite3._ur_original_connect = _SQLITE_ORIGINAL_CONNECT  # type: ignore[attr-defined]
 
-# ----------------------------------------------------------------------------
-# Regex & phoneme helpers
-# ----------------------------------------------------------------------------
-_VOWELS = {"AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"}
 _WORD_CLEAN = re.compile(r"[^a-z0-9\-\s']+")
 
 _HAS_DERIVED_COLS: Optional[bool] = None  # set on first connect
@@ -104,47 +100,13 @@ def _has_valid_db_schema(con: sqlite3.Connection) -> bool:
     except sqlite3.Error:
         return False
 
-def _parse_pron(pron: str) -> List[str]:
-    """
-    Accepts either a space-delimited ARPABET string (e.g., 'T AY1 M')
-    or a JSON array string (e.g., '["T","AY1","M"]'). Returns token list.
-    """
-    if not pron:
-        return []
-    p = pron.strip()
-    if p.startswith("[") and p.endswith("]"):
-        try:
-            arr = json.loads(p)
-            return [t for t in arr if t]
-        except Exception:
-            # fallback to whitespace split
-            return [t for t in p.split() if t]
-    return [t for t in p.split() if t]
-
-def _is_vowel(tok: str) -> bool:
-    return tok.rstrip("0123456789") in _VOWELS
-
 def _derive_tail_keys_from_pron(pron: str):
     """
     From tokens -> (vowel_key, coda_key, rime_key)
     Example: 'H AE1 T' -> ('AE1','T','AE1-T')
     """
-    toks = _parse_pron(pron)
-    if not toks:
-        return ("","","")
-    v_idx = -1
-    for i in range(len(toks)-1, -1, -1):
-        if _is_vowel(toks[i]):
-            v_idx = i
-            break
-    if v_idx < 0:
-        coda = "".join(toks)
-        return ("", coda, coda)
-    vowel = toks[v_idx]
-    after = toks[v_idx+1:]
-    coda = "".join(after) if after else ""
-    rime = f"{vowel}-{coda}" if coda else vowel
-    return (vowel, coda, rime)
+    toks = _parse_pron_field(pron)
+    return _tail_keys(toks)
 
 def _clean_word(s: str) -> str:
     return _WORD_CLEAN.sub("", (s or "").lower()).replace(" ", "").replace("-", "")
