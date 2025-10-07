@@ -1,5 +1,5 @@
 import os, sqlite3, json
-from rhyme_core.search import search_word
+from rhyme_core.search import search_word, _derive_tail_keys_from_pron
 
 def _fake_db(tmp_path):
     os.makedirs("data", exist_ok=True)
@@ -21,10 +21,17 @@ def _fake_db(tmp_path):
     # minimal fake entry set
     w = "window"
     pron = json.dumps(["W","IH1","N","D","OW0"])
-    cur.execute("INSERT OR REPLACE INTO words VALUES(?,?,?,?,?)",
-                (w, pron, 2, json.dumps(["IH1","N","D","OW0"]), json.dumps(["IH1","N","D","OW0"])))
-    cur.execute("INSERT OR REPLACE INTO words VALUES(?,?,?,?,?)",
-                ("thin-blow", pron, 2, json.dumps(["IH1","N","D","OW0"]), json.dumps(["IH1","N","D","OW0"])))
+    vowel_key, coda_key, rime_key = _derive_tail_keys_from_pron(pron)
+    payload = (w, pron, 2,
+               json.dumps(["IH1","N","D","OW0"]),
+               json.dumps(["IH1","N","D","OW0"]),
+               rime_key, vowel_key, coda_key)
+    cur.execute("INSERT OR REPLACE INTO words VALUES(?,?,?,?,?,?,?,?)", payload)
+    cur.execute("INSERT OR REPLACE INTO words VALUES(?,?,?,?,?,?,?,?)",
+                ("thin-blow", pron, 2,
+                 json.dumps(["IH1","N","D","OW0"]),
+                 json.dumps(["IH1","N","D","OW0"]),
+                 rime_key, vowel_key, coda_key))
     con.commit(); con.close()
 
 def test_search_smoke(tmp_path):
