@@ -91,14 +91,41 @@ def _has_valid_db() -> bool:
             return False
         con = sqlite3.connect(str(WORDS_DB))
         try:
-            con.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+            info = con.execute("PRAGMA table_info(words)").fetchall()
         finally:
             con.close()
-        return True
+        cols = {row[1] for row in info}
+        required = {"word", "pron", "syls", "k1", "k2", "rime_key", "vowel_key", "coda_key"}
+        return required.issubset(cols)
     except (OSError, sqlite3.DatabaseError):
         return False
 
 _USE_FALLBACK = not _has_valid_db()
+
+
+@lru_cache(maxsize=1)
+def _words_table_columns() -> Tuple[str, ...]:
+    """Return the columns available on the ``words`` table.
+
+    Some test fixtures create a pared-down SQLite database that only exposes a
+    subset of the production columns.  The search module needs to gracefully
+    degrade when those columns are missing instead of raising ``OperationalError``
+    during the SELECTs performed in ``_db_row_for_word`` and
+    ``_candidate_rows_by_keys``.
+    """
+    if _USE_FALLBACK:
+        return tuple()
+    try:
+        con = sqlite3.connect(str(WORDS_DB))
+    except sqlite3.DatabaseError:
+        return tuple()
+    try:
+        cols = [row[1] for row in con.execute("PRAGMA table_info(words)").fetchall()]
+    except sqlite3.DatabaseError:
+        cols = []
+    finally:
+        con.close()
+    return tuple(cols)
 
 if _USE_FALLBACK and WORDS_DB.exists():
     try:
@@ -117,16 +144,29 @@ def _connect() -> sqlite3.Connection:
     return con
 
 @lru_cache(maxsize=65536)
-def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
+def _db_row_for_word(word: str) -> Optional[Dict[str, object]]:
     if _USE_FALLBACK:
         return None
     w = _clean_word(word)
     if not w:
         return None
+    columns = _words_table_columns()
+    desired = ["word", "pron", "syls", "k1", "k2", "rime_key", "vowel_key", "coda_key"]
+    select_cols = [c for c in desired if c in columns]
+    if not select_cols:
+        return None
     con = _connect()
     try:
-        row = con.execute("SELECT word,pron,syls,k1,k2,rime_key,vowel_key,coda_key FROM words WHERE word=?", (w,)).fetchone()
-        return row
+        query = f"SELECT {','.join(select_cols)} FROM words WHERE word=?"
+        row = con.execute(query, (w,)).fetchone()
+        if row is None:
+            return None
+        data = {col: row[col] for col in row.keys()}
+        for col in desired:
+            data.setdefault(col, None)
+        return data
+    except sqlite3.DatabaseError:
+        return None
     finally:
         con.close()
 
@@ -150,7 +190,8 @@ def _get_pron(word: str) -> List[str] | None:
                 return None
         return None
     try:
-        return json.loads(row["pron"]) or []
+        pron_val = row.get("pron") if isinstance(row, dict) else row["pron"]
+        return json.loads(pron_val) or []
     except Exception:
         return None
 
@@ -160,24 +201,28 @@ def _get_keys(word: str) -> Optional[Tuple[str,str,str,str,str]]:
     row = _db_row_for_word(word)
     if not row:
         return None
-    return (row["rime_key"], row["vowel_key"], row["coda_key"], row["k1"], row["k2"])
+    def _val(key: str) -> str:
+        value = row.get(key) if isinstance(row, dict) else row[key]
+        return value or ""
+    return (_val("rime_key"), _val("vowel_key"), _val("coda_key"), _val("k1"), _val("k2"))
 
 def _candidate_rows_by_keys(rime: str, vowel: str, coda: str, k1: str, k2: str) -> List[sqlite3.Row]:
     """Fetch a widened candidate pool based on any available keys; LIMITs tuned for HF perf."""
     if _USE_FALLBACK:
         return []
+    columns = set(_words_table_columns())
     con = _connect()
     try:
         rows: List[sqlite3.Row] = []
-        if rime:
+        if rime and "rime_key" in columns:
             rows += con.execute("SELECT word,pron,syls FROM words WHERE rime_key=? LIMIT 2000", (rime,)).fetchall()
-        if vowel:
+        if vowel and "vowel_key" in columns:
             rows += con.execute("SELECT word,pron,syls FROM words WHERE vowel_key=? LIMIT 2000", (vowel,)).fetchall()
-        if coda:
+        if coda and "coda_key" in columns:
             rows += con.execute("SELECT word,pron,syls FROM words WHERE coda_key=? LIMIT 1200", (coda,)).fetchall()
-        if k1:
+        if k1 and "k1" in columns:
             rows += con.execute("SELECT word,pron,syls FROM words WHERE k1=? LIMIT 1200", (k1,)).fetchall()
-        if k2:
+        if k2 and "k2" in columns:
             rows += con.execute("SELECT word,pron,syls FROM words WHERE k2=? LIMIT 1200", (k2,)).fetchall()
         return rows
     finally:
