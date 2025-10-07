@@ -3,6 +3,8 @@ import gradio as gr
 from wordfreq import zipf_frequency
 
 # Core logic (use the bucketed API)
+from config import FLAGS
+
 from rhyme_core.search import (
     find_rhymes,
     _get_pron,
@@ -66,7 +68,8 @@ def do_search(*args):
     header_md = f"**{word}** · {q_syl} syllables · stress **{q_stress or '—'}** · metre **{q_metre}**"
 
     # Use bucketed API directly
-    buckets = find_rhymes(word, max_results=100, include_consonant=False) if word else {"uncommon": [], "slant": [], "multiword": []}
+    include_consonant = not FLAGS.get("DISABLE_CONSONANT_RHYMES", True)
+    buckets = find_rhymes(word, max_results=100, include_consonant=include_consonant) if word else {"uncommon": [], "slant": [], "multiword": []}
 
     # Curate uncommon by rarity threshold (already curated internally; apply final rarity gate)
     uncommon_all = buckets.get("uncommon", [])
