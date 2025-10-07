@@ -16,7 +16,7 @@ Schema-flexible reader for the (optional) rap patterns database. It:
 
 Exports
 -------
-- find_patterns_by_keys(query: str, limit: int = 20, db_path: Path | None = None, ...)
+- find_patterns_by_keys(query: str, limit: int = 20, db_path: Path | None = None)
 - find_patterns_by_keys_enriched(query: str, limit: int = 20, db_path: Path | None = None)
 """
 from __future__ import annotations
@@ -29,14 +29,6 @@ from typing import Dict, List, Optional, Tuple
 # Reuse internals from search core
 from .search import classify_rhyme, phrase_to_pron, syllable_count  # type: ignore
 from .search import _get_pron  # type: ignore  # internal but stable
-
-# Optional flags (for consonant toggle)
-try:
-    from config import FLAGS  # type: ignore
-except Exception:  # pragma: no cover
-    class _F:
-        DISABLE_CONSONANT_RHYMES = True
-    FLAGS = _F()  # type: ignore
 
 DATA_DIR = Path("data")
 DEFAULT_DB = DATA_DIR / "patterns_small.db"
@@ -59,32 +51,26 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z']+")
 # SQLite helpers
 # -----------------------------------------------------------------------------
 
-def _open_patterns(db_path: Optional[Path] = None) -> Optional[sqlite3.Connection]:
-    """Open the patterns DB if it exists; otherwise return None (no crash)."""
+def _open_patterns(db_path: Optional[Path] = None) -> sqlite3.Connection:
     p = Path(db_path) if db_path else DEFAULT_DB
-    if not p.exists():
-        return None
     con = sqlite3.connect(str(p))
     con.row_factory = sqlite3.Row
     return con
 
-def _open_words() -> Optional[sqlite3.Connection]:
-    if not WORDS_DB.exists():
-        return None
+def _open_words() -> sqlite3.Connection:
     con = sqlite3.connect(str(WORDS_DB))
     con.row_factory = sqlite3.Row
     return con
 
-def _table_name(con: sqlite3.Connection) -> Optional[str]:
+def _table_name(con: sqlite3.Connection) -> str:
+    # Prefer "patterns" if present
     rows = con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     names = {r[0] for r in rows}
-    if not names:
-        return None
     for t in TABLE_CANDIDATES:
         if t in names:
             return t
-    # fallback to an arbitrary table if present
-    return next(iter(names)) if names else None
+    # fallback to the first table
+    return next(iter(names)) if names else "patterns"
 
 def _columns(con: sqlite3.Connection, table: str) -> Dict[str, int]:
     cols: Dict[str, int] = {}
@@ -122,6 +108,7 @@ def _context_from_lyric(lyric: str, src: str, tgt: str, radius: int = 90) -> str
         if m:
             pos = m.start() if pos is None else min(pos, m.start())
     if pos is None:
+        # Just center on the middle to avoid empty
         mid = max(0, len(text) // 2)
         snippet = text[max(0, mid - radius): min(len(text), mid + radius)]
     else:
@@ -138,8 +125,6 @@ def _keys_for_last_token(query: str) -> Tuple[str, str, str]:
         return "", "", ""
     last = tokens[-1]
     con = _open_words()
-    if con is None:
-        return "", "", ""
     try:
         r = con.execute("SELECT rime_key, vowel_key, coda_key FROM words WHERE word=?", (last,)).fetchone()
         if not r:
@@ -157,7 +142,7 @@ def find_patterns_by_keys(query: str,
                           db_path: Optional[Path] = None,
                           syllable_min: int = 1,
                           syllable_max: int = 16,
-                          include_consonant: Optional[bool] = None) -> List[Dict[str, object]]:
+                          include_consonant: bool = False) -> List[Dict[str, object]]:
     """Return rap pattern rows where either the source or target rhymes with the query.
 
     Narrowing strategy:
@@ -167,18 +152,9 @@ def find_patterns_by_keys(query: str,
 
     We always post-filter by rhyme validity using the same classifier as the main search.
     """
-    # default consonant behavior mirrors config flag (disable by default)
-    if include_consonant is None:
-        include_consonant = not getattr(FLAGS, "DISABLE_CONSONANT_RHYMES", True)
-
     con = _open_patterns(db_path)
-    if con is None:
-        return []  # no DB, no crash
-
     try:
         table = _table_name(con)
-        if not table:
-            return []  # empty DB file; nothing to read
         cols = _columns(con, table)
 
         src_col = _first_present(cols, SRC_CANDIDATES, "source_word") or "source_word"
@@ -196,8 +172,8 @@ def find_patterns_by_keys(query: str,
         fields = [f"{src_col} AS src", f"{tgt_col} AS tgt", f"{lyr_col} AS lyric"]
         if art_col: fields.append(f"{art_col} AS artist")
         if song_col: fields.append(f"{song_col} AS song")
-        if url_col:  fields.append(f"{url_col} AS url")
-        if ctx_col:  fields.append("lyric_context AS lyric_context")
+        if url_col: fields.append(f"{url_col} AS url")
+        if ctx_col: fields.append("lyric_context AS lyric_context")
         sql = f"SELECT {', '.join(fields)} FROM {table}"
         args: List[object] = []
 
