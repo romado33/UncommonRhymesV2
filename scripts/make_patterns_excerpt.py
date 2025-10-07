@@ -1,4 +1,11 @@
-import sqlite3, os
+import logging
+import os
+import sqlite3
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 SRC = "data/patterns.db"         # your full DB (local)
 DST = "data/patterns_small.db"   # ship this to HF Spaces
@@ -24,4 +31,4 @@ for k in keys:
         dcur.executemany(f"INSERT INTO patterns({','.join(cols)}) VALUES ({placeholders})",
                          [tuple(r[c] for c in cols) for r in rows])
 dst.commit(); dst.close(); src.close()
-print("Wrote data/patterns_small.db")
+log.info("Wrote data/patterns_small.db")

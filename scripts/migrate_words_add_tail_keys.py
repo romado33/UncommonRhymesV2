@@ -1,7 +1,17 @@
 # scripts/migrate_words_add_tail_keys.py
 from __future__ import annotations
-import sqlite3, json, argparse, sys
+
+import argparse
+import json
+import logging
+import sqlite3
+import sys
 from typing import List, Tuple
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 VOWELS = {
     "AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"
@@ -85,7 +95,7 @@ def main():
     # sanity check
     tabs = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     if "words" not in tabs:
-        print(f"[error] No 'words' table found in {args.db}")
+        log.error("No 'words' table found in %s", args.db)
         sys.exit(2)
 
     ensure_columns(cur)
@@ -127,7 +137,7 @@ def main():
     index_sql(cur)
     con.commit()
 
-    print(f"[ok] updated={updated}, skipped={skipped}")
+    log.info("[ok] updated=%s, skipped=%s", updated, skipped)
     con.close()
 
 if __name__ == "__main__":
