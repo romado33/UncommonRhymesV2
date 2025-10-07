@@ -5,8 +5,9 @@ def _fake_db(tmp_path):
     os.makedirs("data", exist_ok=True)
     con = sqlite3.connect("data/words_index.sqlite")
     cur = con.cursor()
+    cur.execute("DROP TABLE IF EXISTS words")
     cur.executescript("""
-        CREATE TABLE IF NOT EXISTS words(
+        CREATE TABLE words(
             word TEXT PRIMARY KEY,
             pron TEXT NOT NULL,
             syls INTEGER NOT NULL,
