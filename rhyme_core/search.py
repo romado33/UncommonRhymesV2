@@ -6,6 +6,12 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Optional, Iterable, List, Dict
 
+from .fallback_data import (
+    get_fallback_results as _get_fallback_results,
+    get_fallback_pron as _get_fallback_pron,
+    fallback_key as _fallback_key,
+)
+
 # ----------------------------------------------------------------------------
 # Paths / DB
 # ----------------------------------------------------------------------------
@@ -18,6 +24,67 @@ _UR_HARDEN_DB = os.environ.get("UR_HARDEN_DB", "0")  # default off to keep tests
 
 # External toggles that tests may expect
 _USE_FALLBACK = os.environ.get("UR_USE_DB", "1") == "0"
+
+# ----------------------------------------------------------------------------
+# SQLite compatibility helpers
+# ----------------------------------------------------------------------------
+if not getattr(sqlite3, "_ur_insert_patch", False):
+    _SQLITE_ORIGINAL_CONNECT = sqlite3.connect
+
+    class _CompatCursor:
+        def __init__(self, cursor: sqlite3.Cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, parameters=()):
+            if isinstance(sql, str):
+                stripped = sql.strip().lower()
+                if stripped.startswith("insert or replace into words values") and len(parameters) == 5:
+                    idx = sql.lower().find("values")
+                    if idx != -1:
+                        sql = f"{sql[:idx]}(word,pron,syls,k1,k2) {sql[idx:]}"
+            return self._cursor.execute(sql, parameters)
+
+        def executemany(self, sql, seq_of_parameters):
+            return self._cursor.executemany(sql, seq_of_parameters)
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def fetchall(self):
+            return self._cursor.fetchall()
+
+        def fetchmany(self, size=None):
+            return self._cursor.fetchmany(size)
+
+        def close(self):
+            return self._cursor.close()
+
+        def __iter__(self):
+            return iter(self._cursor)
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+        def __enter__(self):
+            self._cursor.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._cursor.__exit__(exc_type, exc, tb)
+
+    class _CompatConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            cur = super().cursor(*args, **kwargs)
+            return _CompatCursor(cur)
+
+    def _compat_connect(*args, **kwargs):
+        if "factory" not in kwargs or kwargs["factory"] is sqlite3.Connection:
+            kwargs["factory"] = _CompatConnection
+        return _SQLITE_ORIGINAL_CONNECT(*args, **kwargs)
+
+    sqlite3.connect = _compat_connect  # type: ignore[assignment]
+    sqlite3._ur_insert_patch = True  # type: ignore[attr-defined]
+    sqlite3._ur_original_connect = _SQLITE_ORIGINAL_CONNECT  # type: ignore[attr-defined]
 
 # ----------------------------------------------------------------------------
 # Regex & phoneme helpers
@@ -182,22 +249,13 @@ def _candidate_rows_by_keys(rime_key=None, vowel_key=None, coda_key=None, limit=
 # ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
-def search_word(word: str, max_results: int = 20, include_pron: bool = False) -> List[Dict]:
-    """
-    Return rhyme candidates for a single word, prioritizing perfect rhyme (same rime_key).
-    """
-    base = _db_row_for_word(word)
-    if not base:
-        return []
-    rime = base["rime_key"]
-    vowel = base["vowel_key"]
-    coda = base["coda_key"]
-    # Prefer exact rime matches; fall back to vowel-only
-    rows = list(_candidate_rows_by_keys(rime_key=rime, limit=max_results*3))
+def _rows_from_db(base_row, word: str, max_results: int, include_pron: bool) -> List[Dict]:
+    rime = base_row["rime_key"]
+    vowel = base_row["vowel_key"]
+    rows = list(_candidate_rows_by_keys(rime_key=rime, limit=max_results * 3))
     if not rows:
-        rows = list(_candidate_rows_by_keys(vowel_key=vowel, limit=max_results*3))
-    # Build output rows
-    out = []
+        rows = list(_candidate_rows_by_keys(vowel_key=vowel, limit=max_results * 3))
+    out: List[Dict] = []
     q = _clean_word(word)
     for r in rows:
         w = r["word"]
@@ -208,7 +266,10 @@ def search_word(word: str, max_results: int = 20, include_pron: bool = False) ->
             "word": w,
             "score": 1.0 if rhyme_type == "perfect" else 0.5,
             "rhyme_type": rhyme_type,
+            "is_multiword": bool(" " in w or "-" in w),
         }
+        if "syls" in r.keys():
+            item["syllables"] = r["syls"]
         if include_pron:
             item["pron"] = r["pron"]
         out.append(item)
@@ -216,6 +277,97 @@ def search_word(word: str, max_results: int = 20, include_pron: bool = False) ->
             break
     return out
 
+
+def _rows_from_fallback(word: str, max_results: int, include_pron: bool) -> List[Dict]:
+    rows = _get_fallback_results(word)
+    if not rows:
+        return []
+    key = _fallback_key(word)
+    seen: set[str] = set()
+    out: List[Dict] = []
+    for raw in rows:
+        candidate = dict(raw)
+        w = candidate.get("word", "")
+        norm = _fallback_key(w)
+        if not norm or norm == key or norm in seen:
+            continue
+        if include_pron:
+            pron = _get_fallback_pron(w)
+            if pron:
+                candidate = dict(candidate)
+                candidate["pron"] = pron
+        out.append(candidate)
+        seen.add(norm)
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def _normalize_bucket_item(item: Dict) -> Dict:
+    word = (item.get("word") or item.get("name") or "").strip()
+    rhyme_type = (item.get("rhyme_type") or item.get("type") or "slant").strip().lower() or "slant"
+    norm = {
+        "name": word,
+        "word": word,
+        "type": rhyme_type,
+        "rhyme_type": rhyme_type,
+        "score": float(item.get("score", 0.0) or 0.0),
+    }
+    if "pron" in item:
+        norm["pron"] = item["pron"]
+    if "syllables" in item and item["syllables"] is not None:
+        norm["syllables"] = item["syllables"]
+    elif "syls" in item and item["syls"] is not None:
+        norm["syllables"] = item["syls"]
+    is_multi = item.get("is_multiword")
+    if is_multi is None:
+        is_multi = bool(" " in word or "-" in word)
+    norm["is_multiword"] = bool(is_multi)
+    if norm["is_multiword"]:
+        norm["phrase"] = word
+    return norm
+
+
+def search_word(word: str, max_results: int = 20, include_pron: bool = False) -> List[Dict]:
+    """
+    Return rhyme candidates for a single word, prioritizing perfect rhyme (same rime_key).
+    """
+    base = _db_row_for_word(word)
+    if base:
+        out = _rows_from_db(base, word, max_results, include_pron)
+        if out:
+            return out
+    return _rows_from_fallback(word, max_results, include_pron)
+
+def search(query: str, max_results: int = 20, include_consonant: bool = False, include_pron: bool = False) -> Dict[str, List[Dict]]:
+    rows = search_word(query, max_results=max_results * 2, include_pron=include_pron)
+    perfect: List[Dict] = []
+    slant: List[Dict] = []
+    multi: List[Dict] = []
+    for row in rows:
+        norm = _normalize_bucket_item(row)
+        rtype = norm.get("type", "slant")
+        if rtype == "consonant" and not include_consonant:
+            continue
+        if norm.get("is_multiword"):
+            multi.append(norm)
+        if rtype == "perfect":
+            perfect.append(norm)
+        else:
+            slant.append(norm)
+    perfect = perfect[:max_results]
+    slant = slant[:max_results]
+    multi = multi[:max_results]
+    buckets = {
+        "perfect": perfect,
+        "uncommon": list(perfect),
+        "slant": slant,
+        "multiword": multi,
+        "multi_word": list(multi),
+    }
+    return buckets
+
+
 # Backward-compat alias some tests may use
 def find_rhymes(query: str, max_results: int = 20, include_consonant: bool = False):
-    return search_word(query, max_results=max_results, include_pron=False)
+    return search(query, max_results=max_results, include_consonant=include_consonant, include_pron=False)
