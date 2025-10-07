@@ -1,19 +1,22 @@
 # Python
 __pycache__/
-*.pyc
-
-# Virtual env
+*.py[cod]
+*.egg-info/
 .venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
 
-# OS junk
+# OS/editor
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-# Local data (keep CMU + full DB local)
-data/cmudict-0.7b.txt
-data/patterns.db
-
-# Optional: keep these out unless you *want* them in GitHub
-# (OK if each <100 MB; remove these lines if you plan to deploy to HF Spaces straight from GitHub)
-data/words_index.sqlite
-data/patterns_small.db
+# Data/outputs (keep tiny fixtures only)
+data/*.sqlite
+data/*.db
+results/
+*.log
