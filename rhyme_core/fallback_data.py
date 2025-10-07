@@ -436,3 +436,31 @@ _RAW_PRONS = [
 FALLBACK_PRONS: Dict[str, List[str]] = {}
 for word, pron in _RAW_PRONS:
     FALLBACK_PRONS[_clean_key(word)] = pron
+
+
+def fallback_key(word: str) -> str:
+    """Return the canonical lookup key used for fallback dictionaries."""
+    return _clean_key(word)
+
+
+def get_fallback_results(word: str) -> List[Dict[str, object]]:
+    """Return a copy of the canned fallback rows for ``word`` (may be empty)."""
+    key = fallback_key(word)
+    if not key:
+        return []
+    return [dict(item) for item in FALLBACK_FLAT_RESULTS.get(key, ())]
+
+
+def get_fallback_pron(word: str) -> List[str] | None:
+    """Return a pronunciation token list for ``word`` if available."""
+    pron = FALLBACK_PRONS.get(fallback_key(word))
+    return list(pron) if pron else None
+
+
+__all__ = [
+    "FALLBACK_FLAT_RESULTS",
+    "FALLBACK_PRONS",
+    "fallback_key",
+    "get_fallback_pron",
+    "get_fallback_results",
+]
