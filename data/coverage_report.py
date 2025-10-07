@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Scan the benchmark CSV and print simple coverage stats:
-- queries touched
-- buckets with changes (vs baseline) per query
-- rarity proxy coverage (counts by '::' presence; you can extend to parse rarity if exposed)
-- quick heat for which buckets change most under LLM flags
-"""
+"""Scan the benchmark CSV and print simple coverage stats."""
 
-import csv, argparse
+import argparse
+import csv
+import logging
+from collections import Counter, defaultdict
 from pathlib import Path
-from collections import defaultdict, Counter
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 BUCKET_COLS = {
     "uncommon": "uncommon_items",
@@ -38,7 +39,7 @@ def main():
 
     bucket_changes = Counter()
     queries = sorted(by_query.keys())
-    print(f"Queries: {len(queries)}")
+    log.info("Queries: %s", len(queries))
     for q in queries:
         conds = by_query[q]
         base = conds.get("baseline")
@@ -53,9 +54,9 @@ def main():
                 if add or rem:
                     bucket_changes[b] += 1
 
-    print("Buckets with changes (count of queries impacted):")
+    log.info("Buckets with changes (count of queries impacted):")
     for b, c in bucket_changes.most_common():
-        print(f" - {b}: {c}")
+        log.info(" - %s: %s", b, c)
 
 if __name__ == "__main__":
     main()

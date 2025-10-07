@@ -1,9 +1,20 @@
 from __future__ import annotations
-import sqlite3, os, argparse, sys
+
+import argparse
+import logging
+import os
+import sqlite3
+import sys
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 def open_db(path: str) -> sqlite3.Connection:
     if not os.path.exists(path):
-        sys.exit(f"[error] DB not found: {path}")
+        log.error("DB not found: %s", path)
+        sys.exit(1)
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     return con
@@ -23,7 +34,8 @@ def main():
     dst = sqlite3.connect(args.dst); dcur = dst.cursor()
     cols = [r[1] for r in scur.execute(f"PRAGMA table_info({args.table})").fetchall()]
     if not cols:
-        sys.exit(f"[error] Could not read columns for table '{args.table}' in {args.src}")
+        log.error("Could not read columns for table '%s' in %s", args.table, args.src)
+        sys.exit(1)
 
     dcur.executescript("""
         DROP TABLE IF EXISTS patterns;
@@ -56,7 +68,8 @@ def main():
         seen.add(sig); dedup.append(r)
 
     if not dedup:
-        sys.exit("[error] No rows selected; did you run the migration to add key columns?")
+        log.error("No rows selected; did you run the migration to add key columns?")
+        sys.exit(1)
 
     placeholders = ",".join(["?"]*len(cols))
     dcur.executemany(f'INSERT INTO patterns({",".join(cols)}) VALUES ({placeholders})',
@@ -67,6 +80,6 @@ def main():
     if "last_two_syllables_key" in cols:
         dcur.execute('CREATE INDEX IF NOT EXISTS idx_last_two_syllables_key ON patterns(last_two_syllables_key)')
     dst.commit(); dst.close(); src.close()
-    print(f"[ok] Wrote {len(dedup)} rows to {args.dst} with indexes on keys.")
+    log.info("[ok] Wrote %s rows to %s with indexes on keys.", len(dedup), args.dst)
 if __name__ == "__main__":
     main()

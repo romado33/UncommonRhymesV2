@@ -1,12 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Produce a concise Markdown summary from results/benchmark.csv.
-"""
+"""Produce a concise Markdown summary from results/benchmark.csv."""
 
-import csv, argparse
-from pathlib import Path
+import argparse
+import csv
+import logging
 from collections import defaultdict
+from pathlib import Path
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 BUCKET_COLS = {
     "uncommon": "uncommon_items",
@@ -93,7 +98,7 @@ def main():
     outp = Path(args.out)
     outp.parent.mkdir(parents=True, exist_ok=True)
     outp.write_text("\n".join(lines), encoding="utf-8")
-    print(f"✅ Wrote {outp}")
+    log.info("✅ Wrote %s", outp)
 
 if __name__ == "__main__":
     main()

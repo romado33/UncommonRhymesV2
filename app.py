@@ -1,8 +1,11 @@
 from pathlib import Path
+import logging
+
 import gradio as gr
 from wordfreq import zipf_frequency
 
 # Core logic (use the bucketed API)
+from rhyme_core.logging_utils import setup_logging
 from config import FLAGS
 
 from rhyme_core.search import (
@@ -15,6 +18,17 @@ from rhyme_core.prosody import (
     syllable_count,
     metrical_name,
 )
+
+setup_logging()
+log = logging.getLogger(__name__)
+
+_DEFAULT_RHYME_TYPES = ["perfect", "slant", "assonance"]
+_RHYME_CHOICE_MAP = {
+    "perfect": {"perfect"},
+    "slant": {"slant"},
+    "assonance": {"assonant"},
+    "consonance": {"consonant"},
+}
 
 # Patterns DB (returns enriched rows when available)
 try:
@@ -39,26 +53,53 @@ def _prosody_str_from_pron(pron):
     return f"{syls} • {stress or '—'} • {meter}"
 
 
+def _resolve_rhyme_type_selection(selected) -> tuple[list[str], set[str]]:
+    if isinstance(selected, str):
+        selected = [selected]
+    values = [str(v).lower() for v in (selected or []) if v]
+    if not values:
+        values = list(_DEFAULT_RHYME_TYPES)
+    allowed: set[str] = set()
+    for val in values:
+        allowed.update(_RHYME_CHOICE_MAP.get(val, set()))
+    if not allowed:
+        for key in _DEFAULT_RHYME_TYPES:
+            allowed.update(_RHYME_CHOICE_MAP.get(key, set()))
+    return values, allowed
+
+
 # ---------- main handler ----------
 
 def do_search(*args):
     """
     Back-compat handler:
       - 6 args:  word, rhyme_type, slant, syl_min, syl_max, rarity_min
+      - 7 args:  word, rhyme_type, slant, syl_min, syl_max, rarity_min, rhyme_types
       - 9 args:  word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min
+      - 10 args: word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min, rhyme_types
     """
+    rhyme_type_selection = _DEFAULT_RHYME_TYPES
     if len(args) == 6:
-        word, rhyme_type, slant, syl_min, syl_max, rarity_min = args
+        word, _rhyme_type, slant, syl_min, syl_max, rarity_min = args
+        phrase = ""
+        patterns_limit = 50
+    elif len(args) == 7:
+        word, _rhyme_type, slant, syl_min, syl_max, rarity_min, rhyme_type_selection = args
         phrase = ""
         patterns_limit = 50
     elif len(args) == 9:
-        word, phrase, rhyme_type, slant, syl_min, syl_max, _include_pron, patterns_limit, rarity_min = args
+        word, phrase, _rhyme_type, slant, syl_min, syl_max, _include_pron, patterns_limit, rarity_min = args
+    elif len(args) == 10:
+        word, phrase, _rhyme_type, slant, syl_min, syl_max, _include_pron, patterns_limit, rarity_min, rhyme_type_selection = args
     else:  # pragma: no cover
         raise ValueError(f"Unexpected number of inputs: {len(args)}")
 
     word = (word or "").strip()
     phrase = (phrase or "").strip()  # *** no default text, used only if user enters something ***
     rarity_min = float(rarity_min)
+    selected_labels, allowed_rhyme_types = _resolve_rhyme_type_selection(rhyme_type_selection)
+    include_consonant = "consonant" in allowed_rhyme_types
+    log.debug("Search request word=%s phrase=%s rhyme_types=%s", word, phrase, selected_labels)
 
     # quick header summary for the query word
     q_pron = _get_pron(word) or phrase_to_pron(word)
@@ -68,6 +109,11 @@ def do_search(*args):
     header_md = f"**{word}** · {q_syl} syllables · stress **{q_stress or '—'}** · metre **{q_metre}**"
 
     # Use bucketed API directly
+    buckets = find_rhymes(
+        word,
+        max_results=100,
+        include_consonant=include_consonant,
+    ) if word else {"uncommon": [], "slant": [], "multiword": []}
     include_consonant = not FLAGS.get("DISABLE_CONSONANT_RHYMES", True)
     buckets = find_rhymes(word, max_results=100, include_consonant=include_consonant) if word else {"uncommon": [], "slant": [], "multiword": []}
 
@@ -77,6 +123,9 @@ def do_search(*args):
     for u in uncommon_all:
         disp = (u.get("name") or u.get("phrase") or "").strip()
         if not disp:
+            continue
+        typ = str(u.get("type") or "perfect").lower()
+        if typ not in allowed_rhyme_types:
             continue
         if _rarity(disp) >= rarity_min:
             pr = _get_pron(disp) or phrase_to_pron(disp)
@@ -90,6 +139,9 @@ def do_search(*args):
         n = (s.get("name") or s.get("phrase") or "").strip()
         if not n:
             continue
+        typ = str(s.get("type") or "").lower()
+        if typ and typ not in allowed_rhyme_types:
+            continue
         pr = _get_pron(n) or phrase_to_pron(n)
         slant_rows.append([n, _prosody_str_from_pron(pr), s.get("type","")])
 
@@ -97,6 +149,9 @@ def do_search(*args):
     for m in buckets.get("multiword", [])[:50]:
         n = (m.get("name") or m.get("phrase") or "").strip()
         if not n:
+            continue
+        typ = str(m.get("type") or "").lower()
+        if typ and typ not in allowed_rhyme_types:
             continue
         pr = _get_pron(n) or phrase_to_pron(n)
         multi_rows.append([n, _prosody_str_from_pron(pr)])
@@ -144,6 +199,11 @@ def build_ui():
             include_pron = gr.Checkbox(value=False, label="(unused) Show pronunciations")
             patterns_limit = gr.Slider(5, 200, value=50, step=5, label="Patterns max rows")
             rarity_min = gr.Slider(0.30, 0.70, value=0.42, step=0.01, label="Rarity ≥ (uncommon filter)")
+        rhyme_types = gr.CheckboxGroup(
+            label="Include rhyme types",
+            choices=["perfect", "slant", "assonance", "consonance"],
+            value=list(_DEFAULT_RHYME_TYPES),
+        )
 
         btn = gr.Button("Search", variant="primary")
 
@@ -183,15 +243,16 @@ def build_ui():
         # Bind both signatures (compat for cached clients)
         btn.click(
             do_search,
-            [word, rhyme_type, slant, syl_min, syl_max, rarity_min],
+            [word, rhyme_type, slant, syl_min, syl_max, rarity_min, rhyme_types],
             [header, out_uncommon, out_slant, out_multi, out_patterns],
         )
         btn.click(
             do_search,
-            [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min],
+            [word, phrase, rhyme_type, slant, syl_min, syl_max, include_pron, patterns_limit, rarity_min, rhyme_types],
             [header, out_uncommon, out_slant, out_multi, out_patterns],
         )
 
+    demo.queue()
     return demo
 
 

@@ -49,6 +49,10 @@ jobs:
           pip install -r requirements.txt
           pip install pyyaml pytest hypothesis
 
+      - run: pip install ruff mypy
+      - run: ruff check . && ruff format --check .
+      - run: mypy rhyme_core
+
       - name: Ensure results dir
         run: mkdir -p results
 
