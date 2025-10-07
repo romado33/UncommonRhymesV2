@@ -16,7 +16,29 @@ from .phonetics import parse_pron_field as _parse_pron_field, tail_keys as _tail
 # Paths / DB
 # ----------------------------------------------------------------------------
 DATA_DIR = Path("data")
-WORDS_DB = Path(os.environ.get("WORDS_DB_PATH", DATA_DIR / "words_index.sqlite"))
+
+
+def _resolve_words_db() -> Path:
+    """Return the path to the rhyme words SQLite database."""
+
+    def _normalize(raw: str | os.PathLike[str]) -> Path:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            # Resolve relative paths against the repository root / cwd.
+            path = Path.cwd() / path
+        return path
+
+    env_overrides = [
+        os.environ.get("UR_WORDS_DB"),
+        os.environ.get("WORDS_DB_PATH"),
+    ]
+    for candidate in env_overrides:
+        if candidate:
+            return _normalize(candidate)
+    return _normalize(DATA_DIR / "words_index.sqlite")
+
+
+WORDS_DB = _resolve_words_db()
 
 # Hardened DB requirement (prod schema + non-empty) -> else fallback
 _REQUIRED_COLS = {"word","pron","syls","k1","k2","rime_key","vowel_key","coda_key"}
