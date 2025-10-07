@@ -7,12 +7,15 @@ def _fake_db(tmp_path):
     cur = con.cursor()
     cur.execute("DROP TABLE IF EXISTS words")
     cur.executescript("""
-        CREATE TABLE words(
-            word TEXT PRIMARY KEY,
-            pron TEXT NOT NULL,
-            syls INTEGER NOT NULL,
-            k1   TEXT NOT NULL,
-            k2   TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS words(
+        word TEXT PRIMARY KEY,
+        pron TEXT NOT NULL,
+        syls INTEGER NOT NULL,
+        k1   TEXT NOT NULL,
+        k2   TEXT NOT NULL,
+        rime_key  TEXT,
+        vowel_key TEXT,
+        coda_key  TEXT
         );
     """)
     # minimal fake entry set
