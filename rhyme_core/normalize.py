@@ -24,6 +24,7 @@ _DASHES = {
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _DASH_RE = re.compile(r"[-]+")
+_WORD_CLEAN_RE = re.compile(r"[^a-z0-9\-\s']+")
 
 
 def _strip_accents(text: str) -> str:
@@ -49,4 +50,15 @@ def normalize_text(text: str) -> str:
 def normalize_texts(items: Iterable[str]) -> List[str]:
     return [normalize_text(item) for item in items]
 
-__all__ = ["normalize_text", "normalize_texts"]
+
+def normalize_word(text: str) -> str:
+    """Normalize text for dictionary lookups by stripping punctuation and spaces."""
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+    cleaned = _WORD_CLEAN_RE.sub("", normalized)
+    cleaned = cleaned.replace("-", " ")
+    cleaned = cleaned.replace(" ", "")
+    return cleaned.strip()
+
+__all__ = ["normalize_text", "normalize_texts", "normalize_word"]

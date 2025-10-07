@@ -36,3 +36,9 @@ def test_symmetry_like_pair(monkeypatch: pytest.MonkeyPatch):
     rhyme_rows = search.search_word("rhyme", max_results=10)
     assert any(r["word"] == "rhyme" for r in time_rows)
     assert any(r["word"] == "time" for r in rhyme_rows)
+
+
+def test_fallback_normalizes_punctuation(monkeypatch: pytest.MonkeyPatch):
+    search = _reload_search(monkeypatch)
+    rows = search.search_word("hat!!!", max_results=10)
+    assert any(r["word"] == "cat" for r in rows)

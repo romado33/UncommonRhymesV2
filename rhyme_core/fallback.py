@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Optional, Tuple
 
-from .normalize import normalize_text
+from .normalize import normalize_word
 
 # Minimal pronunciation dictionary covering smoke tests and unit tests.
 # Phones are taken from CMUdict and simplified (stress digits retained).
@@ -39,17 +39,20 @@ FALLBACK_WORDS = tuple(sorted(_FALLBACK_PRONS.keys()))
 
 
 def has_fallback(word: str) -> bool:
-    return normalize_text(word) in _FALLBACK_PRONS
+    return normalize_word(word) in _FALLBACK_PRONS
 
 
 def get_fallback_pron(word: str) -> Optional[Tuple[str, ...]]:
-    return _FALLBACK_PRONS.get(normalize_text(word))
+    key = normalize_word(word)
+    if not key:
+        return None
+    return _FALLBACK_PRONS.get(key)
 
 
-def iter_fallback_items(exclude: Iterable[str] = ()):
-    excluded = {normalize_text(e) for e in exclude}
+def iter_fallback_items(exclude: Iterable[str] = ()):  # noqa: D417 - simple generator
+    excluded = {normalize_word(e) for e in exclude}
     for word, pron in _FALLBACK_PRONS.items():
-        if word in excluded:
+        if not word or normalize_word(word) in excluded:
             continue
         yield word, pron
 

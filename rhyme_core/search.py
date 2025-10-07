@@ -46,7 +46,7 @@ from wordfreq import zipf_frequency  # rarity
 
 from config import FLAGS
 
-from rhyme_core.normalize import normalize_text
+from rhyme_core.normalize import normalize_text, normalize_word
 from rhyme_core.prosody import syllable_count, stress_pattern_str  # type: ignore
 
 from .fallback import get_fallback_pron, iter_fallback_items
@@ -80,15 +80,12 @@ LOGGER = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 _VOWELS = {"AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"}
 _STRIP_STRESS = re.compile(r"(\d)")
-_WORD_CLEAN = re.compile(r"[^a-z0-9\\-\\s']+")
 _TOKEN_SPLIT = re.compile(r"[\\s\\-]+")
 
 
 def _clean_word(w: str) -> str:
     """Normalize text and keep alphanumerics for key lookup."""
-    base = normalize_text(w)
-    cleaned = _WORD_CLEAN.sub("", base)
-    return cleaned.replace(" ", "").strip()
+    return normalize_word(w)
 
 def _base_phone(p: str) -> str:
     """Remove stress digits from a CMU phone (e.g., AY1 -> AY)."""
