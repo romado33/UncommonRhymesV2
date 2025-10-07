@@ -16,14 +16,41 @@ from .phonetics import parse_pron_field as _parse_pron_field, tail_keys as _tail
 # Paths / DB
 # ----------------------------------------------------------------------------
 DATA_DIR = Path("data")
-WORDS_DB = Path(os.environ.get("WORDS_DB_PATH", DATA_DIR / "words_index.sqlite"))
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Interpret common truthy/falsey environment values as booleans."""
+    raw = os.environ.get(name, default)
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+        if raw in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+    try:
+        return bool(int(raw))
+    except Exception:
+        return bool(raw)
+
+
+def _resolve_words_db_path() -> Path:
+    """Resolve the words DB path honoring legacy environment variable names."""
+    for key in ("WORDS_DB_PATH", "UR_WORDS_DB"):
+        value = os.environ.get(key)
+        if value:
+            return Path(value)
+    return DATA_DIR / "words_index.sqlite"
+
+
+WORDS_DB = _resolve_words_db_path()
 
 # Hardened DB requirement (prod schema + non-empty) -> else fallback
 _REQUIRED_COLS = {"word","pron","syls","k1","k2","rime_key","vowel_key","coda_key"}
 _UR_HARDEN_DB = os.environ.get("UR_HARDEN_DB", "0")  # default off to keep tests flexible
 
 # External toggles that tests may expect
-_USE_FALLBACK = os.environ.get("UR_USE_DB", "1") == "0"
+_FORCE_FALLBACK = _env_flag("UR_TEST_RHYME_FALLBACK", "0")
+_USE_FALLBACK = _FORCE_FALLBACK or (not _env_flag("UR_USE_DB", "1"))
 
 # ----------------------------------------------------------------------------
 # SQLite compatibility helpers
