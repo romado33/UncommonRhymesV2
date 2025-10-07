@@ -34,40 +34,46 @@ No randomization; LLM hooks are OFF by default.
 from __future__ import annotations
 
 import json
-import os
+import logging
 import re
 import sqlite3
-import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # External deps
 from wordfreq import zipf_frequency  # rarity
-# Prosody helpers from our package
+
+from config import FLAGS
+
+from rhyme_core.normalize import normalize_text
 from rhyme_core.prosody import syllable_count, stress_pattern_str  # type: ignore
-from .fallback_data import FALLBACK_FLAT_RESULTS, FALLBACK_PRONS
 
-# Optional G2P (feature-flagged via config.FLAGS.LLM_OOV_G2P)
-try:
-    from g2p_en import G2p  # type: ignore
-    _G2P = G2p()
-except Exception:  # pragma: no cover - environment without g2p_en
+from .fallback import get_fallback_pron, iter_fallback_items
+from .lfs_guard import looks_like_lfs_pointer
+
+# Optional G2P (used only when USE_LLM=1 and g2p_en is available)
+if FLAGS.get("USE_LLM"):
+    try:
+        from g2p_en import G2p  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        G2p = None  # type: ignore
+        _G2P = None  # type: ignore
+    else:
+        _G2P = None  # type: ignore
+else:  # pragma: no cover - default path when USE_LLM=0
+    G2p = None  # type: ignore
     _G2P = None  # type: ignore
-
-# Optional flags
-try:
-    from config import FLAGS  # type: ignore
-except Exception:
-    class _F:  # minimal fallback so import never breaks in tests
-        LLM_OOV_G2P = False
-    FLAGS = _F()  # type: ignore
 
 # ----------------------------------------------------------------------------
 # Paths / DB
 # ----------------------------------------------------------------------------
 DATA_DIR = Path("data")
 WORDS_DB = DATA_DIR / "words_index.sqlite"
+PATTERNS_DB = DATA_DIR / "patterns_small.db"
+
+logging.basicConfig(level=getattr(logging, str(FLAGS.get("LOG_LEVEL", "INFO")).upper(), logging.INFO))
+LOGGER = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------
 # Regex & phoneme helpers
@@ -77,11 +83,12 @@ _STRIP_STRESS = re.compile(r"(\d)")
 _WORD_CLEAN = re.compile(r"[^a-z0-9\\-\\s']+")
 _TOKEN_SPLIT = re.compile(r"[\\s\\-]+")
 
+
 def _clean_word(w: str) -> str:
-    """Lowercase, strip accents, and remove non word characters for key lookup."""
-    base = unicodedata.normalize("NFKD", (w or "")).encode("ascii", "ignore").decode("ascii")
-    cleaned = _WORD_CLEAN.sub("", base.lower())
-    return cleaned.replace(" ", "").replace("-", "").strip()
+    """Normalize text and keep alphanumerics for key lookup."""
+    base = normalize_text(w)
+    cleaned = _WORD_CLEAN.sub("", base)
+    return cleaned.replace(" ", "").strip()
 
 def _base_phone(p: str) -> str:
     """Remove stress digits from a CMU phone (e.g., AY1 -> AY)."""
@@ -90,34 +97,47 @@ def _base_phone(p: str) -> str:
 # ----------------------------------------------------------------------------
 # DB accessors
 # ----------------------------------------------------------------------------
-def _has_valid_db() -> bool:
+def _db_is_usable() -> bool:
+    reasons: List[str] = []
     if not WORDS_DB.exists():
-        return False
-    try:
-        with WORDS_DB.open("rb") as fh:
-            header = fh.read(16)
-        if not header.startswith(b"SQLite format 3\x00"):
-            return False
-        con = sqlite3.connect(str(WORDS_DB))
+        reasons.append("words_index.sqlite missing")
+    elif looks_like_lfs_pointer(WORDS_DB):
+        reasons.append("words_index.sqlite is a Git LFS pointer")
+    else:
         try:
-            con.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
-        finally:
-            con.close()
-        return True
-    except (OSError, sqlite3.DatabaseError):
+            with sqlite3.connect(str(WORDS_DB)) as con:
+                con.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+        except sqlite3.DatabaseError:
+            reasons.append("words_index.sqlite not readable")
+
+    if not PATTERNS_DB.exists():
+        reasons.append("patterns_small.db missing")
+    elif looks_like_lfs_pointer(PATTERNS_DB):
+        reasons.append("patterns_small.db is a Git LFS pointer")
+
+    if reasons:
+        for msg in reasons:
+            LOGGER.warning("%s; falling back to built-in dataset", msg)
         return False
+    return True
 
 
-_USE_FALLBACK = not _has_valid_db()
+_USE_FALLBACK = not _db_is_usable()
 
-if _USE_FALLBACK and WORDS_DB.exists():
-    try:
-        with WORDS_DB.open("rb") as fh:
-            header = fh.read(16)
-        if not header.startswith(b"SQLite format 3\x00"):
-            WORDS_DB.unlink(missing_ok=True)  # remove LFS pointer so tests can create a fake DB
-    except OSError:
-        pass
+if _USE_FALLBACK and not FLAGS.get("ALLOW_FALLBACK", True):
+    raise RuntimeError("Rhyme database unavailable and fallbacks disabled")
+
+
+def _ensure_g2p():
+    global _G2P
+    if not FLAGS.get("USE_LLM"):
+        return None
+    if _G2P is None and 'G2p' in globals() and G2p is not None:
+        try:
+            _G2P = G2p()  # type: ignore[call-arg]
+        except Exception:
+            _G2P = None
+    return _G2P
 
 
 def _connect() -> sqlite3.Connection:
@@ -136,7 +156,10 @@ def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
         return None
     con = _connect()
     try:
-        row = con.execute("SELECT word,pron,syls,k1,k2,rime_key,vowel_key,coda_key FROM words WHERE word=?", (w,)).fetchone()
+        row = con.execute(
+            "SELECT word,pron,syls,k1,k2,rime_key,vowel_key,coda_key FROM words WHERE word=?",
+            (w,),
+        ).fetchone()
         return row
     finally:
         con.close()
@@ -144,27 +167,30 @@ def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
 # Cache pronunciation lookups aggressively; they're pure and heavily reused.
 @lru_cache(maxsize=100_000)
 def _get_pron(word: str) -> List[str] | None:
-    """Return ARPAbet phones for a *single* word, or None if not present.
-    If FLAGS.LLM_OOV_G2P is True and g2p is available, use it for OOVs.
-    """
-    if _USE_FALLBACK:
-        key = _clean_word(word)
-        pron = FALLBACK_PRONS.get(key)
-        return list(pron) if pron else None
+    """Return ARPAbet phones for a *single* word, or None if not present."""
+    key = _clean_word(word)
+    if not key:
+        return None
+
     row = _db_row_for_word(word)
-    if row is None:
-        if getattr(FLAGS, "LLM_OOV_G2P", False) and _G2P is not None:
-            try:
-                phones = _G2P(_clean_word(word)) or []
-                # g2p_en returns mixed tokens; keep CMU-like uppercase phones only
-                return [p for p in phones if p and p[0].isalpha() and p[0].isupper()]
-            except Exception:
-                return None
-        return None
-    try:
-        return json.loads(row["pron"]) or []
-    except Exception:
-        return None
+    if row is not None:
+        try:
+            return json.loads(row["pron"]) or []
+        except Exception:
+            return None
+
+    fallback_pron = get_fallback_pron(word)
+    if fallback_pron:
+        return list(fallback_pron)
+
+    g2p = _ensure_g2p()
+    if g2p is not None:
+        try:
+            phones = g2p(key) or []
+            return [p for p in phones if p and p[0].isalpha() and p[0].isupper()]
+        except Exception:
+            return None
+    return None
 
 def _get_keys(word: str) -> Optional[Tuple[str,str,str,str,str]]:
     if _USE_FALLBACK:
@@ -292,16 +318,11 @@ def phrase_to_pron(phrase: str) -> List[str]:
     s = (phrase or "").strip()
     if not s:
         return []
-    tokens = [t for t in _TOKEN_SPLIT.split(_clean_word(s)) if t]
+    normalized = normalize_text(s)
+    tokens = [t for t in _TOKEN_SPLIT.split(normalized) if t]
     out: List[str] = []
     for t in tokens:
         p = _get_pron(t)
-        if not p and getattr(FLAGS, "LLM_OOV_G2P", False) and _G2P is not None:
-            try:
-                guess = _G2P(t) or []
-                p = [ph for ph in guess if ph and ph[0].isalpha() and ph[0].isupper()]
-            except Exception:
-                p = []
         if p:
             out.extend(p)
     return out
@@ -330,6 +351,63 @@ def _score_item(rtype: str, stress_eq: bool, rarity: float) -> float:
     # blend rarity mild (keeps determinism; prevents overdominance by ultrarare junk)
     return base * (0.85 + 0.15 * rarity)
 
+
+def _effective_include_consonant(user_override: bool) -> bool:
+    if user_override:
+        return True
+    return not FLAGS.get("DISABLE_CONSONANT_RHYMES", True)
+
+
+def _filter_consonant_rows(rows: List[Dict[str, object]], include_consonant: bool) -> List[Dict[str, object]]:
+    if include_consonant:
+        return rows
+    if not FLAGS.get("DISABLE_CONSONANT_RHYMES", True):
+        return rows
+    return [row for row in rows if row.get("rhyme_type") != "consonant"]
+
+
+def _fallback_candidates(query: str,
+                         rhyme_type: str,
+                         include_consonant: bool,
+                         syllable_min: int,
+                         syllable_max: int,
+                         cap_internal: int) -> List[Dict[str, object]]:
+    qpron_tuple = get_fallback_pron(query)
+    if not qpron_tuple:
+        return []
+    qpron = list(qpron_tuple)
+    qstress = stress_pattern_str(qpron)
+    out: List[Dict[str, object]] = []
+    normalized_query = normalize_text(query)
+    for word, pron_tuple in iter_fallback_items(exclude=[normalized_query]):
+        if normalize_text(word) == normalized_query:
+            continue
+        pron = list(pron_tuple)
+        rtype = classify_rhyme(qpron, pron)
+        if rtype == "none":
+            continue
+        if rtype == "consonant" and not include_consonant:
+            continue
+        if rhyme_type != "any" and rtype != rhyme_type:
+            continue
+        syls = sum(1 for ph in pron if ph and ph[-1].isdigit())
+        if not syls:
+            syls = max(1, syllable_count(word))
+        if syls < syllable_min or syls > syllable_max:
+            continue
+        score = _score_item(rtype, stress_pattern_str(pron) == qstress, _rarity_score(word))
+        out.append({
+            "word": word,
+            "rhyme_type": rtype,
+            "score": float(score),
+            "is_multiword": False,
+            "syllables": int(syls),
+        })
+        if len(out) >= cap_internal:
+            break
+    out.sort(key=lambda x: (-x["score"], x["syllables"], x["word"]))
+    return out
+
 # ----------------------------------------------------------------------------
 # Flat search (internal)
 # ----------------------------------------------------------------------------
@@ -345,19 +423,14 @@ def _search_flat(query: str,
         return []
 
     if _USE_FALLBACK:
-        data = FALLBACK_FLAT_RESULTS.get(q_clean, [])
-        out: List[Dict[str, object]] = []
-        for item in data:
-            if item["syllables"] < syllable_min or item["syllables"] > syllable_max:
-                continue
-            if item["rhyme_type"] == "consonant" and not include_consonant:
-                continue
-            if rhyme_type != "any" and item["rhyme_type"] != rhyme_type:
-                continue
-            out.append(dict(item))
-            if len(out) >= cap_internal:
-                break
-        return out
+        return _fallback_candidates(
+            query,
+            rhyme_type,
+            include_consonant,
+            syllable_min,
+            syllable_max,
+            cap_internal,
+        )
 
     # Obtain query pron; decide if it's a phrase
     query_is_phrase = (" " in q_clean) or (not _db_row_for_word(q_clean))
@@ -438,12 +511,15 @@ def search_word(word: str,
                 include_pron: bool = False,
                 include_consonant: bool = False) -> List[Dict[str, object]]:
     """Flat search API used by some tests/tools."""
-    flat = _search_flat(word,
+    normalized = normalize_text(word)
+    effective_consonant = _effective_include_consonant(include_consonant)
+    flat = _search_flat(normalized,
                         rhyme_type=rhyme_type,
-                        include_consonant=include_consonant,
+                        include_consonant=effective_consonant,
                         syllable_min=syllable_min,
                         syllable_max=syllable_max,
                         cap_internal=max_results)
+    flat = _filter_consonant_rows(flat, effective_consonant)
     if include_pron:
         # attach pron if caller asked (extra SQLite hits avoided intentionally for speed)
         for it in flat:
@@ -477,12 +553,15 @@ def find_rhymes(query: str,
     }
     """
     # widen internal cap then cap per bucket
-    flat = _search_flat(query,
+    normalized = normalize_text(query)
+    effective_consonant = _effective_include_consonant(include_consonant)
+    flat = _search_flat(normalized,
                         rhyme_type="any",
-                        include_consonant=include_consonant,
+                        include_consonant=effective_consonant,
                         syllable_min=syllable_min,
                         syllable_max=syllable_max,
                         cap_internal=max(1200, max_results * 12))
+    flat = _filter_consonant_rows(flat, effective_consonant)
 
     uncommon: List[Dict[str, object]] = []
     slant: List[Dict[str, object]] = []
@@ -498,7 +577,7 @@ def find_rhymes(query: str,
         elif typ in ("assonant", "slant"):
             slant.append(b)
         elif typ == "consonant":
-            if include_consonant:
+            if effective_consonant:
                 slant.append(b)
 
         if is_multi:

@@ -6,6 +6,8 @@ from wordfreq import zipf_frequency
 
 # Core logic (use the bucketed API)
 from rhyme_core.logging_utils import setup_logging
+from config import FLAGS
+
 from rhyme_core.search import (
     find_rhymes,
     _get_pron,
@@ -112,6 +114,8 @@ def do_search(*args):
         max_results=100,
         include_consonant=include_consonant,
     ) if word else {"uncommon": [], "slant": [], "multiword": []}
+    include_consonant = not FLAGS.get("DISABLE_CONSONANT_RHYMES", True)
+    buckets = find_rhymes(word, max_results=100, include_consonant=include_consonant) if word else {"uncommon": [], "slant": [], "multiword": []}
 
     # Curate uncommon by rarity threshold (already curated internally; apply final rarity gate)
     uncommon_all = buckets.get("uncommon", [])
