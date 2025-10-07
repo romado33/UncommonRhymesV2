@@ -1,7 +1,15 @@
 # scripts/migrate_patterns_add_context.py
 from __future__ import annotations
-import argparse, sqlite3
+
+import argparse
+import logging
+import sqlite3
 from pathlib import Path
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 CANDIDATE_TABLES = ["patterns", "rap_patterns", "pairs"]
 
@@ -13,7 +21,8 @@ def pick_table(cur, preferred: str | None):
         if c in names:
             return c
     if not names:
-        raise SystemExit("No tables found in database.")
+        log.error("No tables found in database.")
+        raise SystemExit(1)
     return names[0]
 
 def existing_columns(cur, table: str) -> set[str]:
@@ -39,7 +48,8 @@ def main():
 
     db_path = Path(args.db)
     if not db_path.exists():
-        raise SystemExit(f"DB not found: {db_path}")
+        log.error("DB not found: %s", db_path)
+        raise SystemExit(1)
 
     con = sqlite3.connect(str(db_path))
     try:
@@ -56,13 +66,13 @@ def main():
         cur.execute("COMMIT")
 
         # Show final schema + indices
-        print(f"[ok] Updated table: {table}")
-        print("Columns:")
-        for row in cur.execute(f"PRAGMA table_info({table})"):
-            print(" -", row[1])
-        print("Indices:")
-        for row in cur.execute(f"PRAGMA index_list({table})"):
-            print(" -", row[1])
+        log.info("[ok] Updated table: %s", table)
+        cols = [row[1] for row in cur.execute(f"PRAGMA table_info({table})")]
+        for col in cols:
+            log.info("Column: %s", col)
+        indices = [row[1] for row in cur.execute(f"PRAGMA index_list({table})")]
+        for idx in indices:
+            log.info("Index: %s", idx)
 
     finally:
         con.close()

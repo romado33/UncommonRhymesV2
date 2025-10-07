@@ -1,5 +1,15 @@
 from __future__ import annotations
-import sqlite3, json, argparse, sys
+
+import argparse
+import json
+import logging
+import sqlite3
+import sys
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 def open_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
@@ -43,7 +53,7 @@ def main():
 
     # Verify table exists
     if not table_exists(pcur, args.table):
-        print(f"[error] Table '{args.table}' was not found in {args.patterns}")
+        log.error("Table '%s' was not found in %s", args.table, args.patterns)
         sys.exit(2)
 
     # Ensure columns exist
@@ -95,7 +105,7 @@ def main():
     pcur.execute(f'CREATE INDEX IF NOT EXISTS idx_last_two_syllables_key ON {args.table}(last_two_syllables_key)')
     pcon.commit()
 
-    print(f"[ok] Updated rows: {updated}; missing keys: {missing}")
+    log.info("[ok] Updated rows: %s; missing keys: %s", updated, missing)
     pcon.close(); wcon.close()
 
 if __name__ == "__main__":

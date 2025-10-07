@@ -1,19 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Formal benchmark for Uncommon Rhymes V2.
+"""Formal benchmark for Uncommon Rhymes V2."""
 
-- Deterministic baseline + one-flag-at-a-time LLM runs
-- Provenance snapshot (git/cmu/patterns hashes, py/sqlite/platform, config)
-- Per-query latency (ms) and error fields (search/patterns/prosody)
-- Golden expectations (WARN by default; --golden_fail to hard-fail)
-- Caps per bucket (default 20)
-- Writes CSV + a plain text file listing the queries used
-"""
-
-import os, sys, csv, json, argparse, importlib, subprocess, hashlib, platform, sqlite3, random, time
+import argparse
+import csv
+import hashlib
+import importlib
+import json
+import logging
+import os
+import platform
+import random
+import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Any, Dict, List, Tuple
+
+from rhyme_core.logging_utils import setup_logging
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 LLM_FLAGS = [
     "UR_LLM_RERANK",
@@ -140,7 +148,7 @@ def load_golden(path: Path) -> Dict[str, Any]:
     try:
         import yaml  # type: ignore
     except Exception:
-        print("⚠️ PyYAML not installed; skipping golden checks.")
+        log.warning("PyYAML not installed; skipping golden checks.")
         return {}
     try:
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -291,7 +299,7 @@ def main():
 
     terms_path = Path(args.terms)
     if not terms_path.exists():
-        print(f"❌ Terms file not found: {terms_path}")
+        log.error("❌ Terms file not found: %s", terms_path)
         sys.exit(1)
     terms = [ln.strip() for ln in terms_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
@@ -332,8 +340,8 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print(f"✅ Wrote {len(rows)} rows → {args.out}")
-    print(f"📝 Logged queries → {queries_log}")
+    log.info("✅ Wrote %s rows → %s", len(rows), args.out)
+    log.info("📝 Logged queries → %s", queries_log)
 
 if __name__ == "__main__":
     os.environ.setdefault("UR_LLM_TEMPERATURE", "0")

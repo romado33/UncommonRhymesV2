@@ -141,7 +141,8 @@ def _db_row_for_word(word: str) -> Optional[sqlite3.Row]:
     finally:
         con.close()
 
-@lru_cache(maxsize=65536)
+# Cache pronunciation lookups aggressively; they're pure and heavily reused.
+@lru_cache(maxsize=100_000)
 def _get_pron(word: str) -> List[str] | None:
     """Return ARPAbet phones for a *single* word, or None if not present.
     If FLAGS.LLM_OOV_G2P is True and g2p is available, use it for OOVs.
@@ -218,12 +219,45 @@ def _vowel_and_coda_from_index(pron: Sequence[str], idx: int) -> Tuple[str, Tupl
 def stressed_vowel_and_coda(pron: Sequence[str]) -> Tuple[str, Tuple[str,...]]:
     return _vowel_and_coda_from_index(pron, _last_primary_vowel_index(pron))
 
+
+@lru_cache(maxsize=100_000)
+def _final_coda_cached(pron_key: Tuple[str, ...]) -> Tuple[str, ...]:
+    if not pron_key:
+        return tuple()
+    j = -1
+    for i in range(len(pron_key) - 1, -1, -1):
+        if _base_phone(pron_key[i]) in _VOWELS:
+            j = i
+            break
+    if j < 0:
+        return tuple()
+    return tuple(_base_phone(p) for p in pron_key[j + 1 :])
+
+
+def _final_coda(pron: Sequence[str]) -> Tuple[str, ...]:
+    return _final_coda_cached(tuple(pron))
+
+
 def final_vowel_and_coda(pron: Sequence[str]) -> Tuple[str, Tuple[str,...]]:
     j = -1
     for i in range(len(pron)-1, -1, -1):
         if _base_phone(pron[i]) in _VOWELS:
             j = i; break
     return _vowel_and_coda_from_index(pron, j)
+
+
+@lru_cache(maxsize=100_000)
+def _norm_tail_cached(pron_key: Tuple[str, ...]) -> Tuple[str, ...]:
+    if not pron_key:
+        return tuple()
+    idx = _last_primary_vowel_index(pron_key)
+    if idx < 0:
+        return tuple(_base_phone(p) for p in pron_key)
+    return tuple(_base_phone(p) for p in pron_key[idx:])
+
+
+def _norm_tail(pron: Sequence[str]) -> Tuple[str, ...]:
+    return _norm_tail_cached(tuple(pron))
 
 # ----------------------------------------------------------------------------
 # Classification
